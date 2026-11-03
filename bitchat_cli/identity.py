@@ -36,6 +36,10 @@ class IdentityKeys:
             encoding=_RAW, format=_RAW_PUB
         )
 
+    def noise_private_key_bytes(self) -> bytes:
+        """Raw 32-byte X25519 private key."""
+        return self._static_key.private_bytes_raw()
+
     def sign(self, data: bytes) -> bytes:
         """Ed25519 signature (64 bytes) over the packet's canonical bytes."""
         return self._signing_key.sign(data)

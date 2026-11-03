@@ -20,7 +20,7 @@ class CLI:
         self.ble_service = BLEService(state, self.redraw_prompt)
         self.session = PromptSession(
             completer=WordCompleter(
-                ["/w", "/name", "/send", "/file", "/clear", "/help"], ignore_case=True
+                ["/w", "/peers", "/dm", "/verify", "/unverify", "/name", "/send", "/file", "/clear", "/help"], ignore_case=True
             )
         )
 
@@ -51,6 +51,85 @@ class CLI:
                 for peer_id, nick in self.state.peer_nicknames.items():
                     name = theme.sgr(nick, theme.BOLD, theme.nick_color(nick))
                     self._out(f"  {name} {theme.sgr(peer_id, theme.PATH)}")
+        elif cmd == "/peers":
+            if not getattr(self.state, 'peer_info', None):
+                self._out(theme.system("No verified peers yet — waiting for announces…"))
+            else:
+                import hashlib
+                n = len(self.state.peer_info)
+                self._out(theme.system(f"Verified peers ({n}):"))
+                for peer_id, info in self.state.peer_info.items():
+                    noise_pub = info.get("noise_public_key", b"")
+                    signing_pub = info.get("signing_public_key", b"")
+                    fingerprint = hashlib.sha256(noise_pub).hexdigest()
+                    self._out(f"  {theme.sgr(info.get('nickname','?'), theme.BOLD)} "
+                              f"{theme.sgr(peer_id, theme.PATH)}")
+                    self._out(f"    fingerprint: {fingerprint}")
+                    self._out(f"    signing:     {signing_pub.hex()}")
+                    # Show verification status
+                    verified = self.state.is_verified(peer_id)
+                    v_status = "✓ verified" if verified else "⚠ unverified"
+                    self._out(f"    verify:      {v_status}")
+                    # Show Noise session status
+                    sess = self.ble_service._noise_sessions.get(peer_id)
+                    if sess is not None:
+                        status = "✓ encrypted" if sess.is_finished else "…handshake"
+                        self._out(f"    noise:       {status}")
+        elif cmd == "/dm":
+            if len(parts) < 3:
+                self._out(theme.warn("Usage: /dm <peer_id_prefix> <message>"))
+            else:
+                peer_prefix = parts[1]
+                msg = " ".join(parts[2:])
+                # Find peer by prefix
+                target = None
+                for pid in self.state.peer_info:
+                    if pid.startswith(peer_prefix):
+                        target = pid
+                        break
+                if target is None:
+                    self._out(theme.warn(f"No peer matching '{peer_prefix}'"))
+                else:
+                    await self.ble_service.send_private_message(target, msg)
+        elif cmd == "/verify":
+            if len(parts) < 2:
+                self._out(theme.warn("Usage: /verify <peer_id_prefix>"))
+            else:
+                peer_prefix = parts[1]
+                target = None
+                for pid in self.state.peer_info:
+                    if pid.startswith(peer_prefix):
+                        target = pid
+                        break
+                if target is None:
+                    self._out(theme.warn(f"No peer matching '{peer_prefix}'"))
+                else:
+                    import hashlib
+                    info = self.state.peer_info[target]
+                    noise_pub = info.get("noise_public_key", b"")
+                    fingerprint = hashlib.sha256(noise_pub).hexdigest()
+                    if self.state.verify_peer(target):
+                        self._out(theme.system(f"Verified {info.get('nickname','?')} ({target[:8]})"))
+                        self._out(theme.system(f"  fingerprint: {fingerprint}"))
+                    else:
+                        self._out(theme.warn(f"Could not verify {target[:8]}"))
+        elif cmd == "/unverify":
+            if len(parts) < 2:
+                self._out(theme.warn("Usage: /unverify <peer_id_prefix>"))
+            else:
+                peer_prefix = parts[1]
+                target = None
+                for pid in self.state.peer_info:
+                    if pid.startswith(peer_prefix):
+                        target = pid
+                        break
+                if target is None:
+                    self._out(theme.warn(f"No peer matching '{peer_prefix}'"))
+                else:
+                    if self.state.unverify_peer(target):
+                        self._out(theme.system(f"Unverified {self.state.nickname_for(target)} ({target[:8]})"))
+                    else:
+                        self._out(theme.warn(f"{target[:8]} was not verified"))
         elif cmd == "/name":
             new_nick = text[len("/name"):].strip()
             if not new_nick:
@@ -72,6 +151,10 @@ class CLI:
             self._out(theme.system("Commands:"))
             for name, desc in (
                 ("/w", "List known peers."),
+                ("/peers", "List verified peers with keys."),
+                ("/dm <id> <msg>", "Send encrypted private message."),
+                ("/verify <id>", "Mark a peer as verified (after comparing fingerprints)."),
+                ("/unverify <id>", "Remove verification from a peer."),
                 ("/name <nick>", "Change your nickname and re-announce."),
                 ("/send <path>", "Send an image, voice note, or file to peers."),
                 ("/clear", "Clear the screen."),

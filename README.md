@@ -28,6 +28,9 @@ exchange text, images, voice notes, and files one hop with a real bitchat phone 
 - 📡 **Talks to the real app** — interoperates with [bitchat](https://github.com/permissionlesstech/bitchat) on iOS/Android for public/broadcast chat.
 - 🖼️ **Media support** — send and receive **images, voice notes, and files** (`/send <path>`); received media is saved to `~/.bitchat/downloads/` and opened automatically.
 - 🔐 **Signed messages** — every packet is Ed25519-signed, matching the format the app requires.
+- 🔒 **Noise-encrypted DMs** — private messages over Noise_XX_25519_ChaChaPoly_SHA256, wire-compatible with bitchat phones.
+- ✅ **Out-of-band verification** — compare fingerprints and mark peers as verified with `/verify`.
+- 📡 **BlueZ transport** — uses BlueZ D-Bus for both GATT client and server roles.
 - 🎨 **Themed terminal UI** — timestamps, a stable color per peer, and clear status glyphs. Honors `NO_COLOR`.
 - 🐍 **Pure Python** — built on [`bleak`](https://github.com/hbldh/bleak), runs on Linux, macOS, and Windows.
 
@@ -67,8 +70,11 @@ It immediately starts scanning for nearby bitchat peers, connects to any in rang
 | --- | --- |
 | `<message>` | Any text not starting with `/` is broadcast publicly to peers. |
 | `/send <path>` | Send an image, voice note, or file to peers (alias: `/file`). |
-| `/w` | List known peers (peer ID → nickname). |
-| `/name <nickname>` | Change your nickname and re-announce. |
+| `/peers` | List known peers with keys and verification status. |
+| `/dm <id> <msg>` | Send an encrypted private message. |
+| `/verify <id>` | Mark a peer as verified (after comparing fingerprints). |
+| `/unverify <id>` | Remove verification from a peer. |
+| `/name <nick>` | Change your nickname and re-announce. |
 | `/clear` | Clear the screen. |
 | `/help` | Show the list of available commands. |
 
@@ -77,7 +83,7 @@ It immediately starts scanning for nearby bitchat peers, connects to any in rang
 bitchat-cli uses [`bleak`](https://github.com/hbldh/bleak) as a BLE **central** that discovers, connects to, and exchanges packets with real bitchat peers in range. It implements bitchat's binary wire protocol — announce / leave / public-message / file-transfer packets, PKCS#7 padding, fragment reassembly, and Ed25519 packet signing — so it can take part in **public chat** with the official app.
 
 > [!NOTE]
-> **Scope & limitations.** Only public/broadcast chat is supported. Private (Noise-encrypted) messaging, multi-hop mesh relaying, and advertising as a BLE **peripheral** are not implemented — `bleak` is central-only, so this client works one hop with peers it is connected to and is not itself discoverable when idle.
+> **Scope.** Public/broadcast chat and Noise-encrypted private DMs are supported, along with out-of-band peer verification. Multi-hop mesh relaying and advertising as a BLE **peripheral** are not implemented — this client uses BlueZ as a central and works one hop with peers it is connected to.
 
 ## 🧪 Protocol self-test
 

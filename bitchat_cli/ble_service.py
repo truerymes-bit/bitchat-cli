@@ -1,6 +1,6 @@
 # ble_service.py
 #
-# BLE transport for bitchat. Runs `bleak` as a BLE *central*: it scans for
+# BLE transport for bitchat. Runs BlueZ as a BLE *central*: it scans for
 # devices advertising the bitchat service UUID, connects, subscribes to the
 # bitchat characteristic for notifications, and writes packets to it.
 #
@@ -8,9 +8,8 @@
 # packet (the real app drops unsigned public messages), parse inbound announce/
 # message/leave/fragment packets, and ignore Noise (private) traffic.
 #
-# Note: `bleak` is central-only, so this client cannot advertise as a peripheral
-# or relay; it interoperates one hop with bitchat peers that are in range while
-# it stays connected to them.
+# Note: central role via BlueZ D-Bus + peripheral role via bluez-peripheral (BlueZ).
+# This client can now advertise as a peripheral, so phones can connect to it.
 
 import asyncio
 import os
@@ -18,12 +17,17 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Set
+from typing import Dict, List, Set, Optional
 
-from bleak import BleakClient, BleakScanner
-from bleak.backends.device import BLEDevice
-from bleak.backends.scanner import AdvertisementData
-from bleak.exc import BleakError
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+from cryptography.hazmat.primitives import serialization
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+
+from noise.connection import NoiseConnection, Keypair
+
+from .bluez_central import BluezScanner as BleakScanner, BluezClient as BleakClient, BluezDevice as BLEDevice
+from .bluez_central import BluezAdvertisement as AdvertisementData
 from prompt_toolkit import print_formatted_text
 from prompt_toolkit.formatted_text import ANSI
 
@@ -45,6 +49,7 @@ from .protocol import (
     FragmentReassembler,
     MessageType,
 )
+from .peripheral import BitchatPeripheral
 
 # Real bitchat UUIDs (mainnet). Lower-cased to compare against advertisement data.
 SERVICE_UUID = "f47b5e2d-4a9e-4c5a-9b3f-8e1d2c3a4b5c"
@@ -61,6 +66,90 @@ FRAGMENT_PACING = 0.005         # seconds between BLE writes when sending a frag
 DOWNLOAD_DIR = Path.home() / ".bitchat" / "downloads"
 
 
+class NoiseSession:
+    """Manages a Noise_XX handshake and transport encryption with one peer."""
+    def __init__(self, our_noise_priv: bytes, peer_noise_pub: bytes, is_initiator: bool):
+        self.our_noise_priv = our_noise_priv
+        self.peer_noise_pub = peer_noise_pub
+        self.is_initiator = is_initiator
+        self.conn = NoiseConnection.from_name(b'Noise_XX_25519_ChaChaPoly_SHA256')
+        if is_initiator:
+            self.conn.set_as_initiator()
+        else:
+            self.conn.set_as_responder()
+        self.conn.set_keypair_from_private_bytes(Keypair.STATIC, our_noise_priv)
+        self.conn.start_handshake()
+        self._send_key = None
+        self._recv_key = None
+        self._send_counter = 0
+        self._recv_window = set()  # simplified: track seen counters
+
+    @property
+    def is_finished(self) -> bool:
+        return self.conn.handshake_finished
+
+    def _extract_transport_keys(self):
+        """Extract transport keys from cipher states after handshake."""
+        if self._send_key is None and self.conn.handshake_finished:
+            self._send_key = self.conn.noise_protocol.cipher_state_encrypt.k
+            self._recv_key = self.conn.noise_protocol.cipher_state_decrypt.k
+
+    def start_handshake(self) -> bytes:
+        """Initiator: produce first handshake message. Returns bytes to send."""
+        if self.is_initiator:
+            msg = self.conn.write_message(b'')
+            return bytes(msg)
+        return b''
+
+    def handle_handshake_message(self, data: bytes) -> Optional[bytes]:
+        """Process incoming handshake message. Returns response bytes to send, or None."""
+        try:
+            if self.is_initiator:
+                self.conn.read_message(data)
+                if not self.conn.handshake_finished:
+                    msg = self.conn.write_message(b'')
+                    return bytes(msg)
+                self._extract_transport_keys()
+                return None
+            else:
+                self.conn.read_message(data)
+                if not self.conn.handshake_finished:
+                    msg = self.conn.write_message(b'')
+                    return bytes(msg)
+                self._extract_transport_keys()
+                return None
+        except Exception:
+            return None
+
+    def encrypt(self, plaintext: bytes) -> bytes:
+        if not self.is_finished:
+            raise RuntimeError("Handshake not finished")
+        self._extract_transport_keys()
+        # bitchat transport frame: 4-byte BE nonce ‖ ciphertext ‖ 16-byte tag
+        counter = self._send_counter
+        self._send_counter += 1
+        nonce_bytes = counter.to_bytes(4, 'big')  # only low 32 bits carried
+        # Full nonce: 00000000 ‖ LE64(counter)
+        full_nonce = b'\x00' * 4 + counter.to_bytes(8, 'little')
+        cipher = ChaCha20Poly1305(self._send_key)
+        ct = cipher.encrypt(full_nonce, plaintext, None)  # includes 16-byte tag
+        # Frame: 4-byte BE counter + ciphertext (which includes tag)
+        return nonce_bytes + ct
+
+    def decrypt(self, data: bytes) -> bytes:
+        if not self.is_finished:
+            raise RuntimeError("Handshake not finished")
+        self._extract_transport_keys()
+        if len(data) < 4 + 16:
+            raise ValueError("Frame too short")
+        counter = int.from_bytes(data[:4], 'big')
+        ct = data[4:]  # ciphertext + tag
+        # Full nonce: 00000000 ‖ LE64(counter)
+        full_nonce = b'\x00' * 4 + counter.to_bytes(8, 'little')
+        cipher = ChaCha20Poly1305(self._recv_key)
+        return cipher.decrypt(full_nonce, ct, None)
+
+
 class BLEService:
     """Central-role BLE transport speaking the real bitchat public-chat protocol."""
 
@@ -75,6 +164,8 @@ class BLEService:
         self._reassembler = FragmentReassembler()
         self._scanner: BleakScanner = None
         self._running = False
+        self._peripheral = None
+        self._noise_sessions: Dict[str, NoiseSession] = {}   # peer_id_hex -> session
 
     # ------------------------------------------------------------------ #
     # Lifecycle
@@ -82,12 +173,23 @@ class BLEService:
     async def run(self):
         """Start scanning and keep re-announcing while connected."""
         self._running = True
+        # Start peripheral (advertisement + GATT server) so phones can connect to us
+        try:
+            self._peripheral = BitchatPeripheral(
+                nickname=getattr(self.state, 'nickname', 'bitchat'),
+                dispatch_fn=self._dispatch,
+            )
+            await self._peripheral.start()
+            self._sys("Advertising as bitchat peer (BlueZ peripheral)…")
+        except Exception as e:
+            self._err(f"Peripheral start failed: {e}")
+            self._peripheral = None
         self._scanner = BleakScanner(
             detection_callback=self._on_detection, service_uuids=[SERVICE_UUID]
         )
         try:
             await self._scanner.start()
-        except BleakError as e:
+        except Exception as e:
             self._err(f"Could not start Bluetooth scan: {e}. "
                       f"Check that a Bluetooth adapter is present and enabled.")
             return
@@ -108,6 +210,12 @@ class BLEService:
                 await self.send_leave()
         except Exception:
             pass
+        if self._peripheral is not None:
+            try:
+                await self._peripheral.stop()
+            except Exception:
+                pass
+            self._peripheral = None
         if self._scanner is not None:
             try:
                 await self._scanner.stop()
@@ -154,9 +262,11 @@ class BLEService:
             self.clients[addr] = client
             self.state.add_connection(addr)
             await client.start_notify(CHARACTERISTIC_UUID, self._on_notify)
+            with open("/tmp/notify-debug.log", "a") as f:
+                f.write(f"NOTIFY_SUBSCRIBED: {addr}\n")
             self._ok(f"Connected to a bitchat peer ({addr}).")
             await self.send_announce()  # introduce ourselves so they list us
-        except (asyncio.TimeoutError, BleakError) as e:
+        except (asyncio.TimeoutError, Exception) as e:
             reason = "timed out" if isinstance(e, asyncio.TimeoutError) else str(e)
             self._fail_device(addr, reason)
             await self._safe_disconnect(client)
@@ -197,26 +307,141 @@ class BLEService:
         if addr in self.state.connected_addresses:
             self.state.remove_connection(addr)
             self._leave(f"Disconnected from {addr}")
+        # Clean up Noise sessions for peers on this address
+        # (sessions are keyed by peer_id, not address, so we can't easily
+        #  map address->peer_id here; sessions will be cleaned up on re-announce)
+        # Disconnect cooldown
+        self._cooldown_until[addr] = time.monotonic() + 30.0
 
     # ------------------------------------------------------------------ #
     # Inbound packet handling
     # ------------------------------------------------------------------ #
-    def _on_notify(self, _characteristic, data: bytearray):
+    def _on_notify(self, addr, data: bytearray):
         packet = BitchatPacket.decode(bytes(data))
         if packet is not None:
-            self._dispatch(packet)
+            self._dispatch(packet, addr)
+        else:
+            pass
 
-    def _dispatch(self, packet: BitchatPacket):
+    def _dispatch(self, packet: BitchatPacket, ingress: str = None):
         if packet.sender_id == self.state.my_peer_id:
             return  # our own packet relayed back to us
 
+        # Dedup check
+        import hashlib
+        pid = hashlib.sha256()
+        pid.update(bytes([packet.type]))
+        pid.update(packet.sender_id)
+        pid.update(packet.timestamp.to_bytes(8, 'big'))
+        pid.update(packet.payload)
+        packet_id = pid.digest()[:16]
+
+        if not hasattr(self, '_dedup_cache'):
+            self._dedup_cache = {}
+        now_ms = int(time.time() * 1000)
+        expired = [k for k, v in self._dedup_cache.items() if now_ms - v > 300000]
+        for k in expired:
+            del self._dedup_cache[k]
+        if packet_id in self._dedup_cache:
+            return  # duplicate, drop
+        self._dedup_cache[packet_id] = now_ms
+
         if packet.type == MessageType.FRAGMENT:
+            if packet.ttl > 1:
+                self._schedule_relay(packet, ingress, packet_id)
             inner = self._reassembler.add(packet)
             if inner is not None:
                 reassembled = BitchatPacket.decode(inner)
                 if reassembled is not None:
-                    self._dispatch(reassembled)
+                    self._dispatch(reassembled, ingress)
             return
+
+        # Handle Noise handshake packets
+        if packet.type == MessageType.NOISE_HANDSHAKE:
+            peer_id = packet.sender_id.hex()
+            # Check if this is for us
+            if packet.recipient_id is not None and packet.recipient_id != self.state.my_peer_id:
+                return  # not for us
+            # Get peer's noise public key
+            peer_noise_pub = self.state.get_peer_noise_key(peer_id)
+            if peer_noise_pub is None:
+                return  # unknown peer, drop
+            session = self._noise_sessions.get(peer_id)
+            if session is None:
+                # Create as responder
+                our_noise_priv = self.state.identity.noise_private_key_bytes()
+                session = NoiseSession(our_noise_priv, peer_noise_pub, is_initiator=False)
+                self._noise_sessions[peer_id] = session
+            elif session.is_initiator and len(packet.payload) == 32 and not session.is_finished:
+                # Phone is initiating (msg1) but we already have an initiator session.
+                # Replace with responder session only if handshake not yet advanced.
+                our_noise_priv = self.state.identity.noise_private_key_bytes()
+                session = NoiseSession(our_noise_priv, peer_noise_pub, is_initiator=False)
+                self._noise_sessions[peer_id] = session
+            # Handle the handshake message
+            response = session.handle_handshake_message(packet.payload)
+            if response:
+                # Send response
+                resp_packet = self._sign(BitchatPacket(
+                    type=MessageType.NOISE_HANDSHAKE,
+                    sender_id=self.state.my_peer_id,
+                    recipient_id=packet.sender_id,
+                    payload=response,
+                    ttl=DEFAULT_TTL,
+                ))
+                asyncio.ensure_future(self._broadcast(resp_packet))
+            if session.is_finished:
+                self._sys(f"Noise handshake complete with {peer_id[:8]}")
+            return
+
+        # Handle Noise encrypted messages
+        if packet.type == MessageType.NOISE_ENCRYPTED:
+            peer_id = packet.sender_id.hex()
+            if packet.recipient_id is not None and packet.recipient_id != self.state.my_peer_id:
+                return  # not for us
+            session = self._noise_sessions.get(peer_id)
+            if session is None or not session.is_finished:
+                return  # no session or handshake not complete
+            try:
+                plaintext = session.decrypt(packet.payload)
+                try:
+                    content = plaintext.decode('utf-8')
+                except UnicodeDecodeError:
+                    content = None
+                if content is not None:
+                    # Phone sends DMs as \x01\x00$<UUID>\x01<len><content>
+                    # Type byte: \x01 = DM, \x02 = delivery receipt, \x03 = read receipt
+                    msg_type = content[0] if content else ''
+                    import re
+                    m = re.search(r'\$[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\x01.(.*)', content, re.DOTALL)
+                    if m:
+                        content = m.group(1)
+                    sender = self.state.nickname_for(peer_id)
+                    # Only display type 1 (DM) messages, skip receipts (type 2, 3)
+                    if msg_type == '\x01':
+                        display = content.strip() if content.strip() else "(empty)"
+                        self.state.add_message(
+                            BitchatMessage(content=display, sender=sender, timestamp=packet.timestamp)
+                        )
+                        self._chat(f"[DM] {sender}", display, ts_ms=packet.timestamp)
+            except Exception:
+                pass
+            return
+        signed_types = (MessageType.ANNOUNCE, MessageType.MESSAGE,
+                        MessageType.LEAVE, MessageType.FILE_TRANSFER)
+        if packet.type in signed_types:
+            peer_id = packet.sender_id.hex()
+            # Need signing key from peer's ANNOUNCE
+            signing_key_bytes = self.state.get_peer_signing_key(peer_id)
+            if signing_key_bytes is None:
+                # For ANNOUNCE, we can't verify (no prior key) — allow first ANNOUNCE
+                if packet.type != MessageType.ANNOUNCE:
+                    # No ANNOUNCE received yet — cannot verify, drop
+                    return
+            else:
+                if not self._verify_signature(packet, signing_key_bytes):
+                    # Invalid signature — drop
+                    return
 
         if packet.type == MessageType.ANNOUNCE:
             self._handle_announce(packet)
@@ -226,15 +451,121 @@ class BLEService:
             self._handle_leave(packet)
         elif packet.type == MessageType.FILE_TRANSFER:
             self._handle_file(packet)
-        # NOISE_HANDSHAKE / NOISE_ENCRYPTED / others: private traffic, ignored.
+
+        # Log unhandled packet types
+        known_types = (MessageType.ANNOUNCE, MessageType.MESSAGE, MessageType.LEAVE,
+                       MessageType.NOISE_HANDSHAKE, MessageType.NOISE_ENCRYPTED,
+                       MessageType.FRAGMENT, MessageType.FILE_TRANSFER)
+        if packet.type not in known_types:
+            pass
+
+        # Relay
+        if packet.ttl > 1:
+            self._schedule_relay(packet, ingress, packet_id)
+
+    def _schedule_relay(self, packet: BitchatPacket, ingress: str = None, packet_id: bytes = None):
+        relay_packet = BitchatPacket(
+            type=packet.type,
+            sender_id=packet.sender_id,
+            recipient_id=packet.recipient_id,
+            timestamp=packet.timestamp,
+            payload=packet.payload,
+            signature=packet.signature,
+            ttl=packet.ttl - 1,
+            version=packet.version,
+        )
+        peers = [a for a in self.clients.keys() if a != ingress and self.clients[a].is_connected]
+        if not peers:
+            return
+        if packet.type == MessageType.MESSAGE:
+            import random
+            degree = len(peers)
+            fanout_count = max(1, degree.bit_length())
+            fanout_count = min(fanout_count, degree)
+            seed = hash(packet_id or (bytes(packet.sender_id) + packet.payload)) & 0xFFFFFFFF
+            rng = random.Random(seed)
+            rng.shuffle(peers)
+            peers = peers[:fanout_count]
+        import random as _r
+        jitter = _r.uniform(0.010, 0.220)
+        asyncio.ensure_future(self._relay_after_delay(relay_packet, peers, jitter))
+
+    async def _relay_after_delay(self, packet: BitchatPacket, peers: list, delay: float):
+        await asyncio.sleep(delay)
+        encoded = packet.encode()
+        for addr in peers:
+            client = self.clients.get(addr)
+            if client and client.is_connected:
+                try:
+                    await client.write_gatt_char(CHARACTERISTIC_UUID, encoded, response=False)
+                except Exception:
+                    pass
+        if self._peripheral is not None:
+            try:
+                self._peripheral.notify_all(encoded)
+            except Exception:
+                pass
+
+    def _verify_signature(self, packet: BitchatPacket, signing_key_bytes: bytes) -> bool:
+        """Verify Ed25519 signature on a packet. Returns True if valid."""
+        if packet.signature is None:
+            return False
+        try:
+            pub_key = Ed25519PublicKey.from_public_bytes(signing_key_bytes)
+            pub_key.verify(packet.signature, packet.data_for_signing())
+            return True
+        except (InvalidSignature, Exception):
+            return False
+
+    def _initiate_noise_handshake(self, peer_id_hex: str, peer_noise_pub: bytes):
+        """Create a Noise session and send the first handshake message."""
+        our_noise_priv = self.state.identity.noise_private_key_bytes()
+        try:
+            session = NoiseSession(our_noise_priv, peer_noise_pub, is_initiator=True)
+            self._noise_sessions[peer_id_hex] = session
+            msg = session.start_handshake()
+            if msg:
+                packet = self._sign(BitchatPacket(
+                    type=MessageType.NOISE_HANDSHAKE,
+                    sender_id=self.state.my_peer_id,
+                    recipient_id=bytes.fromhex(peer_id_hex),
+                    payload=msg,
+                    ttl=DEFAULT_TTL,
+                ))
+                asyncio.ensure_future(self._broadcast(packet))
+        except Exception:
+            pass
 
     def _handle_announce(self, packet: BitchatPacket):
         ann = AnnouncementPacket.decode(packet.payload)
         if ann is None:
             return
         peer_id = packet.sender_id.hex()
-        if self.state.set_peer(peer_id, ann.nickname):
+        # Store peer verification info (key consistency check)
+        is_new = self.state.set_peer_info(
+            peer_id, ann.nickname, ann.noise_public_key, ann.signing_public_key
+        )
+        if is_new:
+            # Warn if a peer with the same nickname but different identity appears
+            for existing_pid, existing_nick in self.state.peer_nicknames.items():
+                if existing_pid != peer_id and existing_nick == ann.nickname:
+                    verified_note = " (was verified)" if self.state.is_verified(existing_pid) else ""
+                    self._warn(
+                        f"Peer '{ann.nickname}' appeared with a new identity "
+                        f"({existing_pid[:8]} → {peer_id[:8]}){verified_note} — "
+                        f"verify fingerprint before trusting"
+                    )
+                    break
             self._join(f"{ann.nickname} is now online")
+            # Create Noise session and initiate handshake
+            if peer_id not in self._noise_sessions:
+                self._initiate_noise_handshake(peer_id, ann.noise_public_key)
+        else:
+            # Check if key mismatch caused rejection
+            existing_noise = self.state.get_peer_noise_key(peer_id)
+            if existing_noise is not None and existing_noise != ann.noise_public_key:
+                self._warn(f"Peer {peer_id[:8]} key mismatch — rejected")
+                return
 
     def _handle_message(self, packet: BitchatPacket):
         try:
@@ -336,6 +667,32 @@ class BLEService:
         self._chat(self.state.nickname, content, is_self=True)
         return message
 
+    async def send_private_message(self, peer_id_hex: str, content: str):
+        """Send an encrypted private message to a peer."""
+        session = self._noise_sessions.get(peer_id_hex)
+        if session is None or not session.is_finished:
+            self._warn(f"No Noise session with {peer_id_hex[:8]} — handshake not complete.")
+            return
+        try:
+            import uuid
+            msg_id = str(uuid.uuid4()).upper()
+            content_bytes = content.encode('utf-8')
+            length_byte = chr(len(content_bytes))
+            wire_content = f"\x01\x00${msg_id}\x01{length_byte}{content}"
+            plaintext = wire_content.encode('utf-8')
+            ciphertext = session.encrypt(plaintext)
+            packet = self._sign(BitchatPacket(
+                type=MessageType.NOISE_ENCRYPTED,
+                sender_id=self.state.my_peer_id,
+                recipient_id=bytes.fromhex(peer_id_hex),
+                payload=ciphertext,
+                ttl=0,  # DMs are direct, not relayed
+            ))
+            await self._broadcast(packet)
+            self._chat(f"[DM to {peer_id_hex[:8]}]", content, is_self=True)
+        except Exception as e:
+            self._warn(f"Failed to send private message: {e}")
+
     async def send_leave(self):
         packet = self._sign(BitchatPacket(
             type=MessageType.LEAVE, sender_id=self.state.my_peer_id,
@@ -415,6 +772,10 @@ class BLEService:
                     await asyncio.sleep(FRAGMENT_PACING)
         for addr, reason in failed:
             await self._drop_client(addr, reason)
+        # Also notify subscribed centrals via peripheral role
+        if self._peripheral is not None:
+            for frame in frames:
+                self._peripheral.notify_all(frame)
 
     async def _drop_client(self, addr: str, reason: str = ""):
         """Tear down a dead link and let the scanner reconnect later."""
@@ -422,8 +783,9 @@ class BLEService:
         if client is None:
             return
         self.state.remove_connection(addr)
-        # Hold off immediate reconnection so we don't tight-loop on a bad peer.
-        self._cooldown_until[addr] = time.monotonic() + RETRY_COOLDOWN
+        # Extended cooldown: don't reconnect to this addr for 30s
+        # This prevents tight reconnect loops and lets the scanner find other peers
+        self._cooldown_until[addr] = time.monotonic() + 30.0
         self._leave(f"Lost connection to {addr}" + (f" ({reason})" if reason else ""))
         await self._safe_disconnect(client)
 
