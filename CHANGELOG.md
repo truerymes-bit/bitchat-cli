@@ -8,6 +8,7 @@ Fork of [bitchat-cli](https://github.com/dearabhin/bitchat-cli) v0.2.3 with sign
 
 ### Added
 - **Noise-encrypted DMs**: Bidirectional private messaging over Noise_XX_25519_ChaChaPoly_SHA256, wire-compatible with bitchat phones
+- **Basic multi-hop relay**: TTL decrement, split-horizon, dedup cache, jitter, fanout subsetting (Phase 1)
 - **Out-of-band verification**: `/verify` and `/unverify` commands, persisted to `~/.bitchat/verified_peers.json`
 - **Identity-change warnings**: Alerts when a peer reappears with a new cryptographic identity
 - **BlueZ D-Bus transport**: Replaced `bleak` with native BlueZ GATT client and peripheral server
@@ -35,8 +36,8 @@ Fork of [bitchat-cli](https://github.com/dearabhin/bitchat-cli) v0.2.3 with sign
 - ANNOUNCE throttle and announce-on-connect
 
 ### Not yet implemented
-- Phase 4: Gossip sync for missed messages
-- Phase 5: Topology/source routing for multi-hop delivery
+- Phase 4: Advanced gossip sync for missed messages
+- Phase 5: Topology/source routing for multi-hop delivery optimization
 - BLE peripheral advertising (discoverable when idle)
 
 ### Credits

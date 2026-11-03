@@ -83,7 +83,7 @@ It immediately starts scanning for nearby bitchat peers, connects to any in rang
 bitchat-cli uses BlueZ (via D-Bus) as a BLE **central** that discovers, connects to, and exchanges packets with real bitchat peers in range. It implements bitchat's binary wire protocol — announce / leave / public-message / file-transfer packets, PKCS#7 padding, fragment reassembly, and Ed25519 packet signing — so it can take part in **public chat** with the official app. Private messages use Noise_XX_25519_ChaChaPoly_SHA256 encryption with out-of-band fingerprint verification.
 
 > [!NOTE]
-> **Scope.** Public/broadcast chat and Noise-encrypted private DMs are supported, along with out-of-band peer verification. Multi-hop mesh relaying and advertising as a BLE **peripheral** are not implemented — this client uses BlueZ as a central and works one hop with peers it is connected to.
+> **Scope.** Public/broadcast chat and Noise-encrypted private DMs are supported, along with out-of-band peer verification. Basic multi-hop relay is implemented (TTL decrement, split-horizon, dedup). Advanced gossip sync and topology-aware routing are not yet implemented (Phases 4-5). BLE peripheral advertising is not implemented — this client uses BlueZ as a central and works one hop with peers it is connected to.
 
 ## 🧪 Protocol self-test
 

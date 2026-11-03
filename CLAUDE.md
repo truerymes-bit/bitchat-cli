@@ -16,9 +16,12 @@ A fork of **bitchat-cli** (original: https://github.com/dearabhin/bitchat-cli) w
 - Peer signature verification (Phase 2)
 
 ### What's NOT implemented
-- Multi-hop mesh relaying (gossip sync, Phase 4)
-- Topology/source routing (Phase 5)
+- Advanced gossip sync (Phase 4) — catch-up for missed messages
+- Topology/source routing (Phase 5) — route discovery, optimized path selection
 - BLE peripheral advertising (not discoverable when idle)
+
+### What IS implemented (relay)
+- Basic multi-hop relay: TTL decrement, split-horizon, dedup cache, jitter, fanout subsetting
 
 ## Commands
 
