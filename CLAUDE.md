@@ -18,7 +18,7 @@ A fork of **bitchat-cli** (original: https://github.com/dearabhin/bitchat-cli) w
 - Topology/routing (Phase 5 complete) — TLV 0x04 neighbor gossip, mesh graph tracking, confirmed/unconfirmed edges, source routing (v2 HAS_ROUTE, BFS path, relay-by-route), /topology and /route commands
 
 ### What's NOT implemented
-- BLE peripheral advertising (not discoverable when idle)
+- BLE peripheral advertising IS implemented (GATT server + BLE advertisement)
 
 ### What IS implemented (relay)
 - Basic multi-hop relay: TTL decrement, split-horizon, dedup cache, jitter, fanout subsetting

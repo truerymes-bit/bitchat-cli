@@ -137,7 +137,8 @@ class NoiseSession:
                     return bytes(msg)
                 self._extract_transport_keys()
                 return None
-        except Exception:
+        except Exception as e:
+            self._last_error = str(e)
             return None
 
     def encrypt(self, plaintext: bytes) -> bytes:
@@ -194,6 +195,7 @@ class BLEService:
         import threading
         import json
         self._seen_packets = OrderedDict()
+        self._relayed_fragments = set()
         self._dedup_lock = threading.Lock()
         self._SEEN_CAP = 2000
         # Load persisted seen packets from disk (restart survival)
@@ -337,7 +339,7 @@ class BLEService:
             await client.start_notify(CHARACTERISTIC_UUID, self._on_notify)
             self._ok(f"Connected to a bitchat peer ({addr}).")
             await self.send_announce()  # introduce ourselves so they list us
-        except (asyncio.TimeoutError, Exception) as e:
+        except asyncio.TimeoutError as e:
             reason = "timed out" if isinstance(e, asyncio.TimeoutError) else str(e)
             self._fail_device(addr, reason)
             await self._safe_disconnect(client)
@@ -441,11 +443,29 @@ class BLEService:
         if packet.type == MessageType.FRAGMENT:
             if packet.ttl > 1:
                 self._schedule_relay(packet, ingress, packet_id)
+                # Track that this fragment train was relayed, so the reassembled
+                # inner packet is not relayed again (dedup won't catch it).
+                self._relayed_fragments.add(packet_id)
             inner = self._reassembler.add(packet)
             if inner is not None:
                 reassembled = BitchatPacket.decode(inner)
                 if reassembled is not None:
-                    self._dispatch(reassembled, ingress)
+                    # Compute reassembled packet ID
+                    import hashlib as _h
+                    rid = _h.sha256()
+                    rid.update(bytes([reassembled.type]))
+                    rid.update(reassembled.sender_id)
+                    try:
+                        rid.update(reassembled.timestamp.to_bytes(8, 'big'))
+                    except (OverflowError, ValueError, TypeError, AttributeError):
+                        rid.update((0).to_bytes(8, 'big'))
+                    rid.update(reassembled.payload)
+                    rid = rid.digest()[:16]
+                    if rid in self._relayed_fragments:
+                        # Fragments already relayed; only dispatch, don't relay again
+                        self._dispatch_no_relay(reassembled, ingress)
+                    else:
+                        self._dispatch(reassembled, ingress)
             return
 
         # Handle Noise handshake packets
@@ -464,14 +484,20 @@ class BLEService:
                 our_noise_priv = self.state.identity.noise_private_key_bytes()
                 session = NoiseSession(our_noise_priv, peer_noise_pub, is_initiator=False)
                 self._noise_sessions[peer_id] = session
-            elif session.is_initiator and len(packet.payload) == 32 and not session.is_finished:
-                # Phone is initiating (msg1) but we already have an initiator session.
-                # Replace with responder session only if handshake not yet advanced.
+            elif len(packet.payload) == 32 and (session.is_finished or session.is_initiator):
+                # Phone is initiating (msg1). Replace session if:
+                # - finished (phone restarted, new handshake) — Android replaces established sessions
+                # - initiator collision (yield to responder)
+                if session.is_finished:
+                    self._sys(f"Replacing finished Noise session with {peer_id[:8]} (phone restarted)")
                 our_noise_priv = self.state.identity.noise_private_key_bytes()
                 session = NoiseSession(our_noise_priv, peer_noise_pub, is_initiator=False)
                 self._noise_sessions[peer_id] = session
             # Handle the handshake message
             response = session.handle_handshake_message(packet.payload)
+            if getattr(session, '_last_error', None):
+                self._sys(f"Noise handshake error with {peer_id[:8]}: {session._last_error}")
+                session._last_error = None
             if response:
                 # Send response
                 resp_packet = self._sign(BitchatPacket(
@@ -565,6 +591,14 @@ class BLEService:
         if packet.ttl > 1 and packet.recipient_id != self.state.my_peer_id:
             self._schedule_relay(packet, ingress, packet_id)
 
+    def _dispatch_no_relay(self, packet: BitchatPacket, ingress: str = None):
+        """Dispatch a packet but skip the relay step (fragments already relayed)."""
+        # Temporarily set ttl to 0 to prevent relay, then restore
+        orig_ttl = packet.ttl
+        packet.ttl = 0
+        self._dispatch(packet, ingress)
+        packet.ttl = orig_ttl
+
     def _schedule_relay(self, packet: BitchatPacket, ingress: str = None, packet_id: bytes = None):
         relay_packet = BitchatPacket(
             type=packet.type,
@@ -624,18 +658,23 @@ class BLEService:
     async def _relay_after_delay(self, packet: BitchatPacket, peers: list, delay: float):
         await asyncio.sleep(delay)
         encoded = packet.encode()
-        for addr in peers:
-            client = self.clients.get(addr)
-            if client and client.is_connected:
+        fragmented = len(encoded) > MAX_FRAME_SIZE
+        frames = self._fragment(encoded, packet.type, packet.version, getattr(packet, 'route', None)) if fragmented else [encoded]
+        for frame in frames:
+            for addr in peers:
+                client = self.clients.get(addr)
+                if client and client.is_connected:
+                    try:
+                        await client.write_gatt_char(CHARACTERISTIC_UUID, frame, response=False)
+                    except Exception:
+                        pass
+            if self._peripheral is not None:
                 try:
-                    await client.write_gatt_char(CHARACTERISTIC_UUID, encoded, response=False)
+                    self._peripheral.notify_all(frame)
                 except Exception:
                     pass
-        if self._peripheral is not None:
-            try:
-                self._peripheral.notify_all(encoded)
-            except Exception:
-                pass
+            if fragmented:
+                await asyncio.sleep(FRAGMENT_PACING)
 
     async def _unicast_after_delay(self, packet: BitchatPacket, addr: str, delay: float):
         await asyncio.sleep(delay)
@@ -907,9 +946,12 @@ class BLEService:
             import uuid
             msg_id = str(uuid.uuid4()).upper()
             content_bytes = content.encode('utf-8')
-            length_byte = chr(len(content_bytes))
-            wire_content = f"\x01\x00${msg_id}\x01{length_byte}{content}"
-            plaintext = wire_content.encode('utf-8')
+            if len(content_bytes) > 255:
+                self._warn(f"DM content too long ({len(content_bytes)} bytes > 255) — not sent.")
+                return
+            # Build plaintext as bytes to avoid UTF-8 multi-byte encoding of length
+            wire_prefix = f"\x01\x00${msg_id}\x01".encode('utf-8')
+            plaintext = wire_prefix + bytes([len(content_bytes)]) + content_bytes
             ciphertext = session.encrypt(plaintext)
             packet = self._sign(BitchatPacket(
                 type=MessageType.NOISE_ENCRYPTED,
