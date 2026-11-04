@@ -64,12 +64,18 @@ class BluezScanner:
             await self._adapter_iface.call_set_discovery_filter(
                 {"Transport": Variant("s", "le"), "UUIDs": Variant("as", [SERVICE_UUID])}
             )
-        except Exception:
+        except Exception as e:
+            logging.getLogger("bluez_central").warning(
+                "UUID discovery filter not supported (%s); falling back to LE-only.", e
+            )
             try:
                 await self._adapter_iface.call_set_discovery_filter(
                     {"Transport": Variant("s", "le")}
                 )
-            except Exception:
+            except Exception as e2:
+                logging.getLogger("bluez_central").warning(
+                    "LE discovery filter not supported (%s); falling back to no filter.", e2
+                )
                 try:
                     await self._adapter_iface.call_set_discovery_filter({})
                 except Exception:
