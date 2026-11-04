@@ -24,9 +24,13 @@ CHARACTERISTIC_UUID = "a1b2c3d4-e5f6-4a5b-8c9d-0e1f2a3b4c5d"
 
 class BitchatAdvertisement(Advertisement):
     """Advertisement with TxPower property defined to avoid BlueZ UnknownProperty errors."""
-    @dbus_property(PropertyAccess.READ)
+    @dbus_property(PropertyAccess.READWRITE)
     def TxPower(self) -> "n":  # type: ignore
         return 0  # int16, as BlueZ expects
+
+    @TxPower.setter
+    def TxPower(self, value):
+        pass  # accept writes silently; BlueZ may try to set this
 
 
 class BitchatPeripheral:

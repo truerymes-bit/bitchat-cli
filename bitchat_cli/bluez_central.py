@@ -6,6 +6,12 @@ import asyncio
 import logging
 logging.getLogger("dbus_next").setLevel(logging.CRITICAL)
 
+# Ensure warnings are visible (CLI may not configure logging handlers)
+_handler = logging.StreamHandler()
+_handler.setLevel(logging.WARNING)
+logging.getLogger("bluez_central").addHandler(_handler)
+logging.getLogger("bluez_central").setLevel(logging.WARNING)
+
 class _TxPowerFilter(logging.Filter):
     def filter(self, record):
         return "TxPower" not in record.getMessage()
