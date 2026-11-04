@@ -20,7 +20,7 @@ class CLI:
         self.ble_service = BLEService(state, self.redraw_prompt)
         self.session = PromptSession(
             completer=WordCompleter(
-                ["/w", "/peers", "/dm", "/verify", "/unverify", "/name", "/send", "/file", "/clear", "/sync", "/help"], ignore_case=True
+                ["/w", "/peers", "/dm", "/verify", "/unverify", "/name", "/send", "/file", "/clear", "/sync", "/topology", "/help"], ignore_case=True
             )
         )
 
@@ -151,6 +151,27 @@ class CLI:
                 self._out(theme.system("Gossip sync requested."))
             else:
                 self._out(theme.warn("Sync manager not running."))
+        elif cmd == "/topology":
+            topo = self.state.topology
+            if not topo:
+                self._out(theme.system("No topology data yet — waiting for announces with neighbor gossip."))
+            else:
+                self._out(theme.system("Mesh topology:"))
+                for peer_id, neighbors in topo.items():
+                    nick = self.state.nickname_for(peer_id)
+                    nlist = ", ".join(n[:8] for n in neighbors) if neighbors else "(none)"
+                    self._out(f"  {theme.sgr(nick, theme.BOLD)} ({peer_id[:8]}) -> {nlist}")
+                # Show confirmed/unconfirmed edges
+                conf = self.state.confirmed_edges()
+                unconf = self.state.unconfirmed_edges()
+                if conf:
+                    self._out(theme.system(f"Confirmed edges ({len(conf)}):"))
+                    for a, b in conf:
+                        self._out(f"  {a[:8]} <-> {b[:8]}")
+                if unconf:
+                    self._out(theme.system(f"Unconfirmed edges ({len(unconf)}):"))
+                    for a, b in unconf:
+                        self._out(f"  {a[:8]} -> {b[:8]} (one-way)")
         elif cmd == "/clear":
             print("\033c", end="")
         elif cmd == "/help":
@@ -164,6 +185,7 @@ class CLI:
                 ("/name <nick>", "Change your nickname and re-announce."),
                 ("/send <path>", "Send an image, voice note, or file to peers."),
                 ("/sync", "Trigger a gossip sync with neighbors."),
+                ("/topology", "Show mesh topology graph."),
                 ("/clear", "Clear the screen."),
                 ("/help", "Show this help message."),
             ):

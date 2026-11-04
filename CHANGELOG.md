@@ -51,8 +51,14 @@ Fork of [bitchat-cli](https://github.com/dearabhin/bitchat-cli) v0.2.3 with sign
 - **Commands**: `/sync` to manually trigger gossip sync
 - **Interoperability**: wire format matches bitchat-android GCSFilter (h64 masked to 63-bit, (x-1) Golomb-Rice, zero→1 mapping)
 
+### Phase 5 — Topology (partially implemented)
+- **Neighbor gossip (TLV 0x04)**: ANNOUNCE packets now include directly connected peer IDs
+- **Mesh graph tracking**: topology dict with confirmed/unconfirmed edge detection
+- **Commands**: `/topology` to display mesh graph with confirmed/unconfirmed edges
+- **Not yet**: source routing (v2 packet format with HAS_ROUTE), route calculation, optimized path selection
+
 ### Not yet implemented
-- Phase 5: Topology/source routing for multi-hop delivery optimization
+- Source routing (v2): HAS_ROUTE flag, route list, relay-by-route logic
 - BLE peripheral advertising (discoverable when idle)
 
 ### Credits

@@ -583,6 +583,11 @@ class BLEService:
         is_new = self.state.set_peer_info(
             peer_id, ann.nickname, ann.noise_public_key, ann.signing_public_key
         )
+        # Phase 5: update topology from direct neighbors TLV
+        if ann.direct_neighbors:
+            self.state.update_topology(peer_id, ann.direct_neighbors)
+        # Track this peer as a direct peer (we received their announce over a direct link)
+        self.state.add_direct_peer(peer_id)
         if is_new:
             # Warn if a peer with the same nickname but different identity appears
             for existing_pid, existing_nick in self.state.peer_nicknames.items():
@@ -624,6 +629,7 @@ class BLEService:
         peer_id = packet.sender_id.hex()
         nickname = self.state.nickname_for(peer_id)
         self.state.remove_peer(peer_id)
+        self.state.remove_direct_peer(peer_id)
         if self._sync_manager is not None:
             try:
                 self._sync_manager.remove_announcement_for_peer(peer_id)
@@ -688,10 +694,12 @@ class BLEService:
         return packet
 
     async def send_announce(self):
+        direct_neighbor_ids = [bytes.fromhex(pid) for pid in self.state.direct_peers]
         ann = AnnouncementPacket(
             nickname=self.state.nickname,
             noise_public_key=self.state.identity.noise_public_key_bytes(),
             signing_public_key=self.state.identity.signing_public_key_bytes(),
+            direct_neighbors=direct_neighbor_ids,
         )
         payload = ann.encode()
         if payload is None:

@@ -37,6 +37,11 @@ class ChatState:
         # BLE transport connections, tracked separately for link management.
         self.connected_addresses: Set[str] = set()
 
+        # Topology (Phase 5): peer_id_hex -> set of neighbor peer_id_hex
+        self.topology: Dict[str, Set[str]] = {}
+        # Direct peers: peer_ids we have a direct BLE link to
+        self.direct_peers: Set[str] = set()
+
     @property
     def my_peer_id_hex(self) -> str:
         return self.my_peer_id.hex()
@@ -113,9 +118,52 @@ class ChatState:
         info = self.peer_info.get(peer_id_hex)
         return info["noise_public_key"] if info else None
 
+    def update_topology(self, peer_id_hex: str, neighbors: list):
+        """Update topology from an incoming ANNOUNCE with TLV 0x04."""
+        neighbor_ids = set()
+        for nid_bytes in neighbors:
+            nid_hex = bytes(nid_bytes).hex()
+            if len(nid_hex) >= 16:
+                neighbor_ids.add(nid_hex[:16])
+        self.topology[peer_id_hex] = neighbor_ids
+
+    def add_direct_peer(self, peer_id_hex: str):
+        self.direct_peers.add(peer_id_hex)
+
+    def remove_direct_peer(self, peer_id_hex: str):
+        self.direct_peers.discard(peer_id_hex)
+
+    def confirmed_edges(self) -> list:
+        """Return list of (peer_a, peer_b) tuples that are confirmed (bidirectional)."""
+        edges = []
+        seen = set()
+        for a, neighbors in self.topology.items():
+            for b in neighbors:
+                if b in self.topology and a in self.topology.get(b, set()):
+                    key = tuple(sorted([a, b]))
+                    if key not in seen:
+                        seen.add(key)
+                        edges.append((a, b))
+        return edges
+
+    def unconfirmed_edges(self) -> list:
+        """Return list of (peer_a, peer_b) where only one side announced."""
+        edges = []
+        seen = set()
+        for a, neighbors in self.topology.items():
+            for b in neighbors:
+                if b not in self.topology or a not in self.topology.get(b, set()):
+                    key = tuple(sorted([a, b]))
+                    if key not in seen:
+                        seen.add(key)
+                        edges.append((a, b))
+        return edges
+
     def remove_peer(self, peer_id_hex: str):
         self.peer_nicknames.pop(peer_id_hex, None)
         self.peer_info.pop(peer_id_hex, None)
+        self.topology.pop(peer_id_hex, None)
+        self.direct_peers.discard(peer_id_hex)
 
     def nickname_for(self, peer_id_hex: str) -> str:
         return self.peer_nicknames.get(peer_id_hex, peer_id_hex[:8])

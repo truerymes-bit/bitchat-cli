@@ -303,6 +303,7 @@ class AnnouncementPacket:
     nickname: str
     noise_public_key: bytes      # X25519 static key, 32 bytes
     signing_public_key: bytes    # Ed25519 signing key, 32 bytes
+    direct_neighbors: list = field(default_factory=list)  # list of 8-byte peer IDs (TLV 0x04)
 
     def encode(self) -> Optional[bytes]:
         nick_b = self.nickname.encode("utf-8")
@@ -317,6 +318,23 @@ class AnnouncementPacket:
             data.append(tlv_type)
             data.append(len(value))
             data.extend(value)
+        # TLV 0x04: DIRECT_NEIGHBORS (concatenation of 8-byte peer IDs)
+        if self.direct_neighbors:
+            neighbor_bytes = bytearray()
+            seen = set()
+            for nid in self.direct_neighbors:
+                nid_b = bytes(nid)[:8].ljust(8, b"\x00")
+                key = nid_b
+                if key in seen:
+                    continue
+                seen.add(key)
+                neighbor_bytes.extend(nid_b)
+            if len(neighbor_bytes) > 0 and len(neighbor_bytes) <= 255:
+                # Up to 10 neighbors (80 bytes) per spec, but allow up to 255
+                neighbor_bytes = neighbor_bytes[:80]  # 10 * 8
+                data.append(_AnnTLV.DIRECT_NEIGHBORS)
+                data.append(len(neighbor_bytes))
+                data.extend(neighbor_bytes)
         return bytes(data)
 
     @staticmethod
@@ -334,11 +352,21 @@ class AnnouncementPacket:
                 noise = bytes(value)
             elif tlv_type == _AnnTLV.SIGNING_PUBKEY:
                 signing = bytes(value)
-            # unknown TLVs (e.g. directNeighbors) are skipped for forward-compat
+            elif tlv_type == _AnnTLV.DIRECT_NEIGHBORS:
+                # Parse neighbor list: length/8 peer IDs, 8 bytes each
+                neighbors = []
+                o2 = 0
+                while o2 + 8 <= len(value):
+                    nid = bytes(value[o2:o2 + 8])
+                    neighbors.append(nid)
+                    o2 += 8
+                direct_neighbors = neighbors
+            # unknown TLVs skipped for forward-compat
         if nickname is None or noise is None or signing is None:
             return None
         return AnnouncementPacket(nickname=nickname, noise_public_key=noise,
-                                  signing_public_key=signing)
+                                  signing_public_key=signing,
+                                  direct_neighbors=direct_neighbors if 'direct_neighbors' in locals() else [])
 
 
 # --------------------------------------------------------------------------- #
