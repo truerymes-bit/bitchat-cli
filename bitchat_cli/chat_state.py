@@ -39,6 +39,7 @@ class ChatState:
 
         # Topology (Phase 5): peer_id_hex -> set of neighbor peer_id_hex
         self.topology: Dict[str, Set[str]] = {}
+        self._topology_ts: Dict[str, int] = {}  # peer_id -> last announce timestamp (ms)
         # Direct peers: peer_ids we have a direct BLE link to
         self.direct_peers: Set[str] = set()
 
@@ -118,13 +119,27 @@ class ChatState:
         info = self.peer_info.get(peer_id_hex)
         return info["noise_public_key"] if info else None
 
-    def update_topology(self, peer_id_hex: str, neighbors: list):
-        """Update topology from an incoming ANNOUNCE with TLV 0x04."""
+    def update_topology(self, peer_id_hex: str, neighbors: list, timestamp: int = 0):
+        """Update topology from an incoming ANNOUNCE with TLV 0x04.
+
+        Timestamp-gated: only updates if newer than the last recorded timestamp.
+        Filters self-loops and truncates to 10 neighbors.
+        """
+        # Timestamp gating: ignore if not strictly newer
+        prev_ts = self._topology_ts.get(peer_id_hex, 0)
+        if timestamp > 0 and timestamp <= prev_ts:
+            return
+        if timestamp > 0:
+            self._topology_ts[peer_id_hex] = timestamp
         neighbor_ids = set()
-        for nid_bytes in neighbors:
+        for nid_bytes in neighbors[:10]:
             nid_hex = bytes(nid_bytes).hex()
             if len(nid_hex) >= 16:
-                neighbor_ids.add(nid_hex[:16])
+                nid_hex = nid_hex[:16]
+                # Filter self-loop
+                if nid_hex == peer_id_hex:
+                    continue
+                neighbor_ids.add(nid_hex)
         self.topology[peer_id_hex] = neighbor_ids
 
     def add_direct_peer(self, peer_id_hex: str):
@@ -163,7 +178,11 @@ class ChatState:
         self.peer_nicknames.pop(peer_id_hex, None)
         self.peer_info.pop(peer_id_hex, None)
         self.topology.pop(peer_id_hex, None)
+        self._topology_ts.pop(peer_id_hex, None)
         self.direct_peers.discard(peer_id_hex)
+        # Remove from other peers' neighbor sets
+        for pid in list(self.topology.keys()):
+            self.topology[pid].discard(peer_id_hex)
 
     def nickname_for(self, peer_id_hex: str) -> str:
         return self.peer_nicknames.get(peer_id_hex, peer_id_hex[:8])

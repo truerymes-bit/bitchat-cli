@@ -83,7 +83,7 @@ FRAGMENT_PACING = 0.005         # seconds between BLE writes when sending a frag
 
 # Where received media (images, voice notes, files) is saved.
 DOWNLOAD_DIR = Path.home() / ".bitchat" / "downloads"
-
+SEEN_PATH = Path.home() / ".bitchat" / "seen_packets.json"
 
 class NoiseSession:
     """Manages a Noise_XX handshake and transport encryption with one peer."""
@@ -186,6 +186,32 @@ class BLEService:
         self._peripheral = None
         self._noise_sessions: Dict[str, NoiseSession] = {}   # peer_id_hex -> session
         self._sync_manager: Optional[GossipSyncManager] = None
+        # Map BLE address -> peer_id_hex for direct peers, for cleanup on drop
+        self._direct_addr_to_peer: Dict[str, str] = {}
+        # Capacity-bounded seen-set (LRU) for packet dedup, persisted to disk.
+        from collections import OrderedDict
+        import threading
+        import json
+        self._seen_packets = OrderedDict()
+        self._dedup_lock = threading.Lock()
+        self._SEEN_CAP = 2000
+        # Load persisted seen packets from disk (restart survival)
+        try:
+            with open(SEEN_PATH) as f:
+                data = json.load(f)
+            for pid_hex in data.get("seen", []):
+                try:
+                    pid_bytes = bytes.fromhex(pid_hex)
+                except (ValueError, TypeError):
+                    continue
+                if len(pid_bytes) != 16:
+                    continue
+                self._seen_packets[pid_bytes] = None
+            # Trim to capacity (oldest first)
+            while len(self._seen_packets) > self._SEEN_CAP:
+                self._seen_packets.popitem(last=False)
+        except (FileNotFoundError, json.JSONDecodeError, OSError, AttributeError, TypeError):
+            pass
 
     # ------------------------------------------------------------------ #
     # Lifecycle
@@ -217,11 +243,17 @@ class BLEService:
 
         # Start gossip sync manager (Phase 4)
         self._sync_manager = GossipSyncManager(self.state, self)
+        # Transfer persisted seen packets to sync manager
+        with self._dedup_lock:
+            self._sync_manager._seen_packet_ids = set(self._seen_packets.keys())
         await self._sync_manager.start()
 
         try:
             while self._running:
                 await asyncio.sleep(ANNOUNCE_INTERVAL)
+                # Clean up stale peripheral addresses
+                if self._peripheral is not None:
+                    self._peripheral.cleanup_stale(300.0)
                 if self.clients:
                     await self.send_announce()
         except asyncio.CancelledError:
@@ -245,6 +277,16 @@ class BLEService:
                 await self._sync_manager.stop()
             except Exception:
                 pass
+            # Persist seen packets to disk before clearing
+            try:
+                import json
+                SEEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+                with self._dedup_lock:
+                    seen_ids = list(self._seen_packets.keys())
+                with open(SEEN_PATH, "w") as f:
+                    json.dump({"seen": [p.hex() for p in seen_ids]}, f)
+            except (OSError, AttributeError, TypeError, ValueError):
+                pass
             self._sync_manager = None
         if self._scanner is not None:
             try:
@@ -263,7 +305,7 @@ class BLEService:
     def _on_detection(self, device: BLEDevice, adv: AdvertisementData):
         if not self._running:
             return
-        addr = device.address
+        addr = device.address.upper()
         if addr in self.clients or addr in self._connecting or addr in self._ignored:
             return
         if time.monotonic() < self._cooldown_until.get(addr, 0.0):
@@ -276,7 +318,7 @@ class BLEService:
         asyncio.create_task(self._connect(device))
 
     async def _connect(self, device: BLEDevice):
-        addr = device.address
+        addr = device.address.upper()
         attempts = self._attempts.get(addr, 0) + 1
         self._attempts[addr] = attempts
         client = BleakClient(device, disconnected_callback=self._on_disconnect)
@@ -329,12 +371,16 @@ class BLEService:
             pass
 
     def _on_disconnect(self, client: BleakClient):
-        addr = client.address
+        addr = client.address.upper()
         self.clients.pop(addr, None)
         self._connecting.discard(addr)
         if addr in self.state.connected_addresses:
             self.state.remove_connection(addr)
             self._leave(f"Disconnected from {addr}")
+        # Clean up direct-peer tracking for this address
+        peer_id = self._direct_addr_to_peer.pop(addr, None)
+        if peer_id is not None:
+            self.state.remove_direct_peer(peer_id)
         # Clean up Noise sessions for peers on this address
         # (sessions are keyed by peer_id, not address, so we can't easily
         #  map address->peer_id here; sessions will be cleaned up on re-announce)
@@ -360,19 +406,36 @@ class BLEService:
         pid = hashlib.sha256()
         pid.update(bytes([packet.type]))
         pid.update(packet.sender_id)
-        pid.update(packet.timestamp.to_bytes(8, 'big'))
+        try:
+            pid.update(packet.timestamp.to_bytes(8, 'big'))
+        except (OverflowError, ValueError, TypeError, AttributeError):
+            try:
+                pid.update((int(packet.timestamp) % (1 << 64)).to_bytes(8, 'big'))
+            except (OverflowError, ValueError, TypeError, AttributeError):
+                pid.update((0).to_bytes(8, 'big'))
         pid.update(packet.payload)
         packet_id = pid.digest()[:16]
 
-        if not hasattr(self, '_dedup_cache'):
-            self._dedup_cache = {}
-        now_ms = int(time.time() * 1000)
-        expired = [k for k, v in self._dedup_cache.items() if now_ms - v > 300000]
-        for k in expired:
-            del self._dedup_cache[k]
-        if packet_id in self._dedup_cache:
-            return  # duplicate, drop
-        self._dedup_cache[packet_id] = now_ms
+        # Capacity-bounded seen-set (no time-based expiry).  Uses an
+        # OrderedDict as an LRU set: keys are packet IDs, values are None.
+        # Thread-safe via _dedup_lock.  Also consults the sync manager's
+        # seen set for public packets so both paths share one source of truth.
+        with self._dedup_lock:
+            if packet_id in self._seen_packets:
+                return  # duplicate, drop
+            # Also check sync manager's seen set for public packets
+            if self._sync_manager is not None and packet.type in (MessageType.ANNOUNCE, MessageType.MESSAGE):
+                if packet_id in getattr(self._sync_manager, '_seen_packet_ids', set()):
+                    return  # already known via sync
+            # Evict oldest if at capacity
+            if len(self._seen_packets) >= self._SEEN_CAP:
+                self._seen_packets.popitem(last=False)
+            self._seen_packets[packet_id] = None
+        # Record in sync manager's seen set for public packets
+        if self._sync_manager is not None and packet.type in (MessageType.ANNOUNCE, MessageType.MESSAGE):
+            if not hasattr(self._sync_manager, '_seen_packet_ids'):
+                self._sync_manager._seen_packet_ids = set()
+            self._sync_manager._seen_packet_ids.add(packet_id)
 
         if packet.type == MessageType.FRAGMENT:
             if packet.ttl > 1:
@@ -478,7 +541,7 @@ class BLEService:
                     return
 
         if packet.type == MessageType.ANNOUNCE:
-            self._handle_announce(packet)
+            self._handle_announce(packet, ingress)
         elif packet.type == MessageType.MESSAGE:
             self._handle_message(packet)
         elif packet.type == MessageType.LEAVE:
@@ -574,7 +637,7 @@ class BLEService:
         except Exception:
             pass
 
-    def _handle_announce(self, packet: BitchatPacket):
+    def _handle_announce(self, packet: BitchatPacket, ingress: str = None):
         ann = AnnouncementPacket.decode(packet.payload)
         if ann is None:
             return
@@ -583,11 +646,24 @@ class BLEService:
         is_new = self.state.set_peer_info(
             peer_id, ann.nickname, ann.noise_public_key, ann.signing_public_key
         )
-        # Phase 5: update topology from direct neighbors TLV
-        if ann.direct_neighbors:
-            self.state.update_topology(peer_id, ann.direct_neighbors)
-        # Track this peer as a direct peer (we received their announce over a direct link)
-        self.state.add_direct_peer(peer_id)
+        # Phase 5: update topology from direct neighbors TLV (even if empty)
+        self.state.update_topology(peer_id, ann.direct_neighbors or [], timestamp=packet.timestamp)
+        # Track as direct peer only if received over a direct BLE link.
+        # Require a first-hop announce (ttl == DEFAULT_TTL): relayed or
+        # gossip-synced announces (ttl < DEFAULT_TTL / ttl == 0) must not
+        # promote a peer to direct, otherwise multi-hop peers get falsely
+        # marked as direct links.
+        is_direct = False
+        if ingress is not None and packet.ttl == DEFAULT_TTL:
+            if ingress in self.clients:
+                is_direct = True
+            elif self._peripheral is not None and ingress in self._peripheral.connected_addresses:
+                is_direct = True
+        if is_direct:
+            self.state.add_direct_peer(peer_id)
+            self._direct_addr_to_peer[ingress] = peer_id
+            # Send announce immediately so peer sees us as a direct neighbor
+            asyncio.ensure_future(self.send_announce())
         if is_new:
             # Warn if a peer with the same nickname but different identity appears
             for existing_pid, existing_nick in self.state.peer_nicknames.items():
@@ -694,7 +770,12 @@ class BLEService:
         return packet
 
     async def send_announce(self):
-        direct_neighbor_ids = [bytes.fromhex(pid) for pid in self.state.direct_peers]
+        direct_neighbor_ids = []
+        for pid in self.state.direct_peers:
+            try:
+                direct_neighbor_ids.append(bytes.fromhex(pid))
+            except (ValueError, TypeError):
+                pass
         ann = AnnouncementPacket(
             nickname=self.state.nickname,
             noise_public_key=self.state.identity.noise_public_key_bytes(),

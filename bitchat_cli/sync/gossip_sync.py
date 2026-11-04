@@ -37,6 +37,8 @@ class GossipSyncManager:
         self.ble = ble_service
         # packet_id hex -> packet (broadcast messages)
         self._messages: Dict[str, BitchatPacket] = {}
+        # Capacity-bounded seen set shared with ble_service dedup
+        self._seen_packet_ids: set = set()
         # sender peer hex -> (packet_id hex, packet) (latest announce per peer)
         self._latest_announce: Dict[str, Tuple[str, BitchatPacket]] = {}
         self._running = False
@@ -79,6 +81,7 @@ class GossipSyncManager:
                 if bytes(rid) != b"\xff" * 8:
                     return  # not broadcast
         pid = packet_id_from_packet(packet)
+        self._seen_packet_ids.add(pid)
         pid_hex = pid.hex()
 
         if packet.type == MessageType.MESSAGE:

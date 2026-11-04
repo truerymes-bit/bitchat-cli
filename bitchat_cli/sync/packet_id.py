@@ -13,7 +13,13 @@ def compute_packet_id(packet_type: int, sender_id: bytes, timestamp: int,
     h = hashlib.sha256()
     h.update(bytes([packet_type]))
     h.update(sender_id[:8].ljust(8, b"\x00"))
-    h.update(timestamp.to_bytes(8, "big"))
+    try:
+        h.update(int(timestamp).to_bytes(8, "big"))
+    except (OverflowError, ValueError, TypeError, AttributeError):
+        try:
+            h.update((int(timestamp) % (1 << 64)).to_bytes(8, "big"))
+        except (OverflowError, ValueError, TypeError, AttributeError):
+            h.update((0).to_bytes(8, "big"))
     h.update(payload)
     return h.digest()[:16]
 

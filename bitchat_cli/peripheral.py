@@ -44,6 +44,8 @@ class BitchatPeripheral:
         self._service = None
         self._advert = None
         self._agent = None
+        self.connected_addresses: set = set()
+        self._addr_last_seen: dict = {}  # addr -> monotonic timestamp
 
     async def start(self):
         self._bus = await get_message_bus()
@@ -69,8 +71,12 @@ class BitchatPeripheral:
                     addr = None
                     if device_path:
                         parts = str(device_path).split('/')[-1]
-                        addr = parts.replace('dev_', '').replace('_', ':')
+                        addr = parts.replace('dev_', '').replace('_', ':').upper()
                     packet = BitchatPacket.decode(bytes(data))
+                    if addr is not None:
+                        import time as _t
+                        outer.connected_addresses.add(addr)
+                        outer._addr_last_seen[addr] = _t.monotonic()
                     if packet is not None:
                         outer.dispatch_fn(packet, addr)
                 except Exception:
@@ -100,6 +106,15 @@ class BitchatPeripheral:
                 self._char.changed(data)
             except Exception:
                 pass
+
+    def cleanup_stale(self, max_age: float = 300.0):
+        """Remove peripheral addresses not seen in max_age seconds."""
+        import time as _t
+        now = _t.monotonic()
+        stale = [a for a, t in self._addr_last_seen.items() if now - t > max_age]
+        for a in stale:
+            self.connected_addresses.discard(a)
+            self._addr_last_seen.pop(a, None)
 
     async def stop(self):
         if self._advert is not None:

@@ -322,16 +322,18 @@ class AnnouncementPacket:
         if self.direct_neighbors:
             neighbor_bytes = bytearray()
             seen = set()
+            count = 0
             for nid in self.direct_neighbors:
+                if count >= 10:
+                    break
                 nid_b = bytes(nid)[:8].ljust(8, b"\x00")
                 key = nid_b
                 if key in seen:
                     continue
                 seen.add(key)
                 neighbor_bytes.extend(nid_b)
-            if len(neighbor_bytes) > 0 and len(neighbor_bytes) <= 255:
-                # Up to 10 neighbors (80 bytes) per spec, but allow up to 255
-                neighbor_bytes = neighbor_bytes[:80]  # 10 * 8
+                count += 1
+            if len(neighbor_bytes) > 0:
                 data.append(_AnnTLV.DIRECT_NEIGHBORS)
                 data.append(len(neighbor_bytes))
                 data.extend(neighbor_bytes)
@@ -352,11 +354,11 @@ class AnnouncementPacket:
                 noise = bytes(value)
             elif tlv_type == _AnnTLV.SIGNING_PUBKEY:
                 signing = bytes(value)
-            elif tlv_type == _AnnTLV.DIRECT_NEIGHBORS:
-                # Parse neighbor list: length/8 peer IDs, 8 bytes each
+            elif tlv_type == _AnnTLV.DIRECT_NEIGHBORS and 'direct_neighbors' not in locals():
+                # Parse neighbor list: length/8 peer IDs, 8 bytes each (max 10)
                 neighbors = []
                 o2 = 0
-                while o2 + 8 <= len(value):
+                while o2 + 8 <= len(value) and len(neighbors) < 10:
                     nid = bytes(value[o2:o2 + 8])
                     neighbors.append(nid)
                     o2 += 8
