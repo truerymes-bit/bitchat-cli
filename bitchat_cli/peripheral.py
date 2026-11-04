@@ -9,14 +9,24 @@ import logging
 
 from bluez_peripheral.gatt.service import Service, ServiceCollection
 from bluez_peripheral.gatt.characteristic import characteristic, CharacteristicFlags
-from bluez_peripheral.advert import Advertisement, PacketType, AdvertisingIncludes
 from bluez_peripheral.util import get_message_bus, Adapter
 from bluez_peripheral.agent import NoIoAgent
 
 from .protocol import BitchatPacket
 
+from bluez_peripheral.advert import Advertisement, PacketType, AdvertisingIncludes
+from dbus_next.constants import PropertyAccess
+from dbus_next.service import dbus_property
+
 SERVICE_UUID = "f47b5e2d-4a9e-4c5a-9b3f-8e1d2c3a4b5c"
 CHARACTERISTIC_UUID = "a1b2c3d4-e5f6-4a5b-8c9d-0e1f2a3b4c5d"
+
+
+class BitchatAdvertisement(Advertisement):
+    """Advertisement with TxPower property defined to avoid BlueZ UnknownProperty errors."""
+    @dbus_property(PropertyAccess.READ)
+    def TxPower(self) -> "n":  # type: ignore
+        return 0  # int16, as BlueZ expects
 
 
 class BitchatPeripheral:
@@ -68,7 +78,7 @@ class BitchatPeripheral:
         # Grab the characteristic instance for notifications
         self._char = self._service._characteristics[0]
 
-        self._advert = Advertisement(
+        self._advert = BitchatAdvertisement(
             localName=self.nickname,
             serviceUUIDs=[SERVICE_UUID],
             appearance=0,
