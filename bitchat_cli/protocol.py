@@ -425,6 +425,7 @@ class FragmentReassembler:
         self._buffers: Dict[Tuple[bytes, bytes], Dict[int, bytes]] = {}
         self._totals: Dict[Tuple[bytes, bytes], int] = {}
         self._max_total = max_total
+        self.last_key = None
 
     def add(self, packet: "BitchatPacket") -> Optional[bytes]:
         parsed = parse_fragment(packet)
@@ -446,4 +447,5 @@ class FragmentReassembler:
             return None
         self._buffers.pop(key, None)
         self._totals.pop(key, None)
+        self.last_key = key
         return reassembled

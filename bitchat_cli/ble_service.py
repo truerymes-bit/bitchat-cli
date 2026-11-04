@@ -164,11 +164,21 @@ class NoiseSession:
         if len(data) < 4 + 16:
             raise ValueError("Frame too short")
         counter = int.from_bytes(data[:4], 'big')
+        # Replay protection: reject already-seen counters
+        if counter in self._recv_window:
+            raise ValueError("Replayed frame")
         ct = data[4:]  # ciphertext + tag
         # Full nonce: 00000000 ‖ LE64(counter)
         full_nonce = b'\x00' * 4 + counter.to_bytes(8, 'little')
         cipher = ChaCha20Poly1305(self._recv_key)
-        return cipher.decrypt(full_nonce, ct, None)
+        result = cipher.decrypt(full_nonce, ct, None)
+        self._recv_window.add(counter)
+        # Bound the window
+        if len(self._recv_window) > 1000:
+            # Keep only the most recent 500
+            sorted_counters = sorted(self._recv_window)
+            self._recv_window = set(sorted_counters[-500:])
+        return result
 
 
 class BLEService:
@@ -340,13 +350,9 @@ class BLEService:
             await client.start_notify(CHARACTERISTIC_UUID, self._on_notify)
             self._ok(f"Connected to a bitchat peer ({addr}).")
             await self.send_announce()  # introduce ourselves so they list us
-        except asyncio.TimeoutError as e:
+        except Exception as e:  # noqa: BLE001 - never let a connect kill the loop
             reason = "timed out" if isinstance(e, asyncio.TimeoutError) else str(e)
             self._fail_device(addr, reason)
-            await self._safe_disconnect(client)
-        except Exception as e:  # noqa: BLE001 - never let a connect kill the loop
-            self._err(f"Unexpected error with {addr}: {e}")
-            self._ignored.add(addr)
             await self._safe_disconnect(client)
         finally:
             self._connecting.discard(addr)
@@ -455,28 +461,13 @@ class BLEService:
                         self._relayed_fragments.clear()
             inner = self._reassembler.add(packet)
             if inner is not None:
+                frag_key = self._reassembler.last_key
                 reassembled = BitchatPacket.decode(inner)
                 if reassembled is not None:
-                    # Compute reassembled packet ID
-                    import hashlib as _h
-                    rid = _h.sha256()
-                    rid.update(bytes([reassembled.type]))
-                    rid.update(reassembled.sender_id)
-                    try:
-                        rid.update(reassembled.timestamp.to_bytes(8, 'big'))
-                    except (OverflowError, ValueError, TypeError, AttributeError):
-                        rid.update((0).to_bytes(8, 'big'))
-                    rid.update(reassembled.payload)
-                    # Check if fragments from this sender were already relayed.
-                    # _relayed_fragments stores (sender_id, fragment_id) tuples.
-                    # Since reassembled packet loses fragment_id, check by sender_id.
-                    sender_key = bytes(reassembled.sender_id)
-                    already_relayed = any(k[0] == sender_key for k in self._relayed_fragments)
-                    if already_relayed:
-                        # Fragments already relayed; only dispatch, don't relay again
+                    # Check if this specific fragment train was already relayed
+                    if frag_key in self._relayed_fragments:
                         self._dispatch_no_relay(reassembled, ingress)
-                        # Clean up entries for this sender
-                        self._relayed_fragments = {k for k in self._relayed_fragments if k[0] != sender_key}
+                        self._relayed_fragments.discard(frag_key)
                     else:
                         self._dispatch(reassembled, ingress)
             return
@@ -535,26 +526,37 @@ class BLEService:
                 return  # no session or handshake not complete
             try:
                 plaintext = session.decrypt(packet.payload)
+                # Parse wire format as bytes: \x01\x00$<UUID>\x01<len><content>
+                # Type byte: \x01 = DM, \x02 = delivery receipt, \x03 = read receipt
+                # Don't decode entire plaintext as UTF-8 (length byte may be >= 0x80)
+                if len(plaintext) < 40:
+                    return
+                msg_type = chr(plaintext[0]) if plaintext[0] < 128 else ''
+                # Find UUID and length byte (offset 38 = \x01 marker, 39 = length)
+                # Format: type(1) + 0x00(1) + $(1) + UUID(36) + 0x01(1) + len(1) + content
+                if plaintext[1] != 0 or plaintext[2] != ord('$'):
+                    return
+                # UUID is 36 chars at offset 3
+                uuid_end = 3 + 36
+                if uuid_end + 2 > len(plaintext):
+                    return
+                if plaintext[uuid_end] != 0x01:
+                    return
+                content_len = plaintext[uuid_end + 1]
+                content_start = uuid_end + 2
+                content_bytes = plaintext[content_start:content_start + content_len]
                 try:
-                    content = plaintext.decode('utf-8')
+                    content = content_bytes.decode('utf-8')
                 except UnicodeDecodeError:
                     content = None
-                if content is not None:
-                    # Phone sends DMs as \x01\x00$<UUID>\x01<len><content>
-                    # Type byte: \x01 = DM, \x02 = delivery receipt, \x03 = read receipt
-                    msg_type = content[0] if content else ''
-                    import re
-                    m = re.search(r'\$[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\x01.(.*)', content, re.DOTALL)
-                    if m:
-                        content = m.group(1)
-                    sender = self.state.nickname_for(peer_id)
-                    # Only display type 1 (DM) messages, skip receipts (type 2, 3)
-                    if msg_type == '\x01':
-                        display = content.strip() if content.strip() else "(empty)"
-                        self.state.add_message(
-                            BitchatMessage(content=display, sender=sender, timestamp=packet.timestamp)
-                        )
-                        self._chat(f"[DM] {sender}", display, ts_ms=packet.timestamp)
+                sender = self.state.nickname_for(peer_id)
+                # Only display type 1 (DM) messages, skip receipts (type 2, 3)
+                if msg_type == '\x01' and content is not None:
+                    display = content.strip() if content.strip() else "(empty)"
+                    self.state.add_message(
+                        BitchatMessage(content=display, sender=sender, timestamp=packet.timestamp)
+                    )
+                    self._chat(f"[DM] {sender}", display, ts_ms=packet.timestamp)
             except Exception:
                 pass
             return
