@@ -14,9 +14,9 @@ A fork of **bitchat-cli** (original: https://github.com/dearabhin/bitchat-cli) w
 - GATT peripheral server (`peripheral.py`)
 - Packet relay with dedup, jitter, TTL decrement, split-horizon (Phase 1)
 - Peer signature verification (Phase 2)
+- Gossip sync (Phase 4) — GCS filter sync, REQUEST_SYNC, initial/periodic sync, announcement retention/pruning
 
 ### What's NOT implemented
-- Advanced gossip sync (Phase 4) — catch-up for missed messages
 - Topology/source routing (Phase 5) — route discovery, optimized path selection
 - BLE peripheral advertising (not discoverable when idle)
 

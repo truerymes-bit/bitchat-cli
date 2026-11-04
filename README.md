@@ -29,6 +29,7 @@ exchange text, images, voice notes, and files one hop with a real bitchat phone 
 - 🖼️ **Media support** — send and receive **images, voice notes, and files** (`/send <path>`); received media is saved to `~/.bitchat/downloads/` and opened automatically.
 - 🔐 **Signed messages** — every packet is Ed25519-signed, matching the format the app requires.
 - 🔒 **Noise-encrypted DMs** — private messages over Noise_XX_25519_ChaChaPoly_SHA256, wire-compatible with bitchat phones.
+- 🔄 **Gossip sync** — GCS filter sync for catch-up on missed messages and announcements (Phase 4).
 - ✅ **Out-of-band verification** — compare fingerprints and mark peers as verified with `/verify`.
 - 📡 **BlueZ transport** — uses BlueZ D-Bus for both GATT client and server roles.
 - 🎨 **TUI** — timestamps, a stable color per peer, and clear status glyphs. Honors `NO_COLOR`.
@@ -83,7 +84,7 @@ It immediately starts scanning for nearby bitchat peers, connects to any in rang
 bitchat-cli uses BlueZ (via D-Bus) as a BLE **central** that discovers, connects to, and exchanges packets with real bitchat peers in range. It implements bitchat's binary wire protocol — announce / leave / public-message / file-transfer packets, PKCS#7 padding, fragment reassembly, and Ed25519 packet signing — so it can take part in **public chat** with the official app. Private messages use Noise_XX_25519_ChaChaPoly_SHA256 encryption with out-of-band fingerprint verification.
 
 > [!NOTE]
-> **Scope.** Public/broadcast chat and Noise-encrypted private DMs are supported, along with out-of-band peer verification. Basic multi-hop relay is implemented (TTL decrement, split-horizon, dedup). Advanced gossip sync and topology-aware routing are not yet implemented (Phases 4-5). BLE peripheral advertising is not implemented — this client uses BlueZ as a central and works one hop with peers it is connected to.
+> **Scope.** Public/broadcast chat and Noise-encrypted private DMs are supported, along with out-of-band peer verification. Basic multi-hop relay is implemented (TTL decrement, split-horizon, dedup). Gossip sync (Phase 4) is implemented — peers exchange GCS filters to catch up on missed messages and announcements. Topology-aware routing (Phase 5) is not yet implemented. BLE peripheral advertising is not implemented — this client uses BlueZ as a central and works one hop with peers it is connected to.
 
 ## 🧪 Protocol self-test
 

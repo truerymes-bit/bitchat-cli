@@ -20,7 +20,7 @@ class CLI:
         self.ble_service = BLEService(state, self.redraw_prompt)
         self.session = PromptSession(
             completer=WordCompleter(
-                ["/w", "/peers", "/dm", "/verify", "/unverify", "/name", "/send", "/file", "/clear", "/help"], ignore_case=True
+                ["/w", "/peers", "/dm", "/verify", "/unverify", "/name", "/send", "/file", "/clear", "/sync", "/help"], ignore_case=True
             )
         )
 
@@ -145,6 +145,12 @@ class CLI:
                 self._out(theme.warn(f"Usage: {cmd} <path-to-file>"))
             else:
                 await self.ble_service.send_file(path)
+        elif cmd == "/sync":
+            if self.ble_service._sync_manager is not None:
+                await self.ble_service._sync_manager.send_periodic_sync()
+                self._out(theme.system("Gossip sync requested."))
+            else:
+                self._out(theme.warn("Sync manager not running."))
         elif cmd == "/clear":
             print("\033c", end="")
         elif cmd == "/help":
@@ -157,6 +163,7 @@ class CLI:
                 ("/unverify <id>", "Remove verification from a peer."),
                 ("/name <nick>", "Change your nickname and re-announce."),
                 ("/send <path>", "Send an image, voice note, or file to peers."),
+                ("/sync", "Trigger a gossip sync with neighbors."),
                 ("/clear", "Clear the screen."),
                 ("/help", "Show this help message."),
             ):

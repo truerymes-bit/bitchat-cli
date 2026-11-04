@@ -38,7 +38,7 @@ bitchat-cli = "bitchat_cli.main:main"
 bitchat = "bitchat_cli.main:main"
 
 [tool.setuptools]
-packages = ["bitchat_cli"]
+packages = ["bitchat_cli", "bitchat_cli.sync"]
 
 [tool.setuptools.dynamic]
 version = { attr = "bitchat_cli.__version__" }

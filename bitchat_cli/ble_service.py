@@ -68,6 +68,7 @@ from .protocol import (
     MessageType,
 )
 from .peripheral import BitchatPeripheral
+from .sync.gossip_sync import GossipSyncManager
 
 # Real bitchat UUIDs (mainnet). Lower-cased to compare against advertisement data.
 SERVICE_UUID = "f47b5e2d-4a9e-4c5a-9b3f-8e1d2c3a4b5c"
@@ -184,6 +185,7 @@ class BLEService:
         self._running = False
         self._peripheral = None
         self._noise_sessions: Dict[str, NoiseSession] = {}   # peer_id_hex -> session
+        self._sync_manager: Optional[GossipSyncManager] = None
 
     # ------------------------------------------------------------------ #
     # Lifecycle
@@ -213,6 +215,10 @@ class BLEService:
             return
         self._sys("Scanning for bitchat peers over Bluetooth…")
 
+        # Start gossip sync manager (Phase 4)
+        self._sync_manager = GossipSyncManager(self.state, self)
+        await self._sync_manager.start()
+
         try:
             while self._running:
                 await asyncio.sleep(ANNOUNCE_INTERVAL)
@@ -234,6 +240,12 @@ class BLEService:
             except Exception:
                 pass
             self._peripheral = None
+        if self._sync_manager is not None:
+            try:
+                await self._sync_manager.stop()
+            except Exception:
+                pass
+            self._sync_manager = None
         if self._scanner is not None:
             try:
                 await self._scanner.stop()
@@ -443,6 +455,12 @@ class BLEService:
             except Exception:
                 pass
             return
+        # Handle gossip sync requests (Phase 4)
+        if packet.type == MessageType.REQUEST_SYNC:
+            if self._sync_manager is not None:
+                asyncio.ensure_future(self._sync_manager.handle_request_sync(packet, ingress))
+            return
+
         signed_types = (MessageType.ANNOUNCE, MessageType.MESSAGE,
                         MessageType.LEAVE, MessageType.FILE_TRANSFER)
         if packet.type in signed_types:
@@ -474,6 +492,10 @@ class BLEService:
                        MessageType.FRAGMENT, MessageType.FILE_TRANSFER)
         if packet.type not in known_types:
             pass
+
+        # Record public packets for gossip sync (Phase 4)
+        if self._sync_manager is not None and packet.type in (MessageType.ANNOUNCE, MessageType.MESSAGE):
+            self._sync_manager.record_packet(packet)
 
         # Relay
         if packet.ttl > 1:
@@ -576,6 +598,9 @@ class BLEService:
             # Create Noise session and initiate handshake
             if peer_id not in self._noise_sessions:
                 self._initiate_noise_handshake(peer_id, ann.noise_public_key)
+            # Schedule initial gossip sync with new peer (Phase 4)
+            if self._sync_manager is not None:
+                self._sync_manager.schedule_initial_sync(peer_id)
         else:
             # Check if key mismatch caused rejection
             existing_noise = self.state.get_peer_noise_key(peer_id)
@@ -599,6 +624,11 @@ class BLEService:
         peer_id = packet.sender_id.hex()
         nickname = self.state.nickname_for(peer_id)
         self.state.remove_peer(peer_id)
+        if self._sync_manager is not None:
+            try:
+                self._sync_manager.remove_announcement_for_peer(peer_id)
+            except Exception:
+                pass
         self._leave(f"{nickname} went offline")
 
     def _handle_file(self, packet: BitchatPacket):
@@ -671,6 +701,8 @@ class BLEService:
             recipient_id=None, payload=payload, ttl=DEFAULT_TTL,
         ))
         await self._broadcast(packet)
+        if self._sync_manager is not None:
+            self._sync_manager.record_packet(packet)
 
     async def send_public_message(self, content: str) -> BitchatMessage:
         packet = self._sign(BitchatPacket(
@@ -678,6 +710,8 @@ class BLEService:
             recipient_id=None, payload=content.encode("utf-8"), ttl=DEFAULT_TTL,
         ))
         await self._broadcast(packet)
+        if self._sync_manager is not None:
+            self._sync_manager.record_packet(packet)
         message = BitchatMessage(content=content, sender=self.state.nickname)
         self.state.add_message(message)
         self._chat(self.state.nickname, content, is_self=True)
@@ -792,6 +826,30 @@ class BLEService:
         if self._peripheral is not None:
             for frame in frames:
                 self._peripheral.notify_all(frame)
+
+    async def _broadcast_raw(self, data: bytes):
+        """Send pre-encoded bytes to all connected clients + peripheral."""
+        for addr, client in list(self.clients.items()):
+            if not client.is_connected:
+                continue
+            try:
+                await client.write_gatt_char(CHARACTERISTIC_UUID, data, response=False)
+            except Exception:
+                pass
+        if self._peripheral is not None:
+            try:
+                self._peripheral.notify_all(data)
+            except Exception:
+                pass
+
+    async def _send_to_address(self, addr: str, data: bytes):
+        """Send pre-encoded bytes to a single client by BLE address."""
+        client = self.clients.get(addr)
+        if client is not None and client.is_connected:
+            try:
+                await client.write_gatt_char(CHARACTERISTIC_UUID, data, response=False)
+            except Exception:
+                pass
 
     async def _drop_client(self, addr: str, reason: str = ""):
         """Tear down a dead link and let the scanner reconnect later."""
