@@ -115,6 +115,7 @@ class BitchatPacket:
     signature: Optional[bytes] = None
     ttl: int = DEFAULT_TTL
     version: int = VERSION
+    route: Optional[List[bytes]] = None  # Source route: intermediate hops (v2 only)
 
     def encode(self, padding: bool = True) -> bytes:
         """Serialize to the binary wire format. We never compress on send.
@@ -129,6 +130,8 @@ class BitchatPacket:
             flags |= PacketFlags.HAS_RECIPIENT
         if self.signature is not None:
             flags |= PacketFlags.HAS_SIGNATURE
+        if self.route and self.version >= 2:
+            flags |= PacketFlags.HAS_ROUTE
 
         sender = self.sender_id[:SENDER_ID_SIZE].ljust(SENDER_ID_SIZE, b"\x00")
         payload_len = len(self.payload)
@@ -152,6 +155,12 @@ class BitchatPacket:
         data += sender
         if self.recipient_id is not None:
             data += self.recipient_id[:RECIPIENT_ID_SIZE].ljust(RECIPIENT_ID_SIZE, b"\x00")
+        # Source route (v2 only): Count (1 byte) + Hops (N * 8 bytes)
+        if self.route and self.version >= 2:
+            hops = [h[:SENDER_ID_SIZE].ljust(SENDER_ID_SIZE, b"\x00") for h in self.route]
+            data += len(hops).to_bytes(1, "big")
+            for h in hops:
+                data += h
         data += self.payload
         if self.signature is not None:
             data += self.signature[:SIGNATURE_SIZE]
@@ -169,7 +178,7 @@ class BitchatPacket:
         unsigned = BitchatPacket(
             type=self.type, sender_id=self.sender_id, recipient_id=self.recipient_id,
             timestamp=self.timestamp, payload=self.payload, signature=None,
-            ttl=0, version=self.version,
+            ttl=0, version=self.version, route=self.route,
         )
         return unsigned.encode(padding=True)
 
@@ -231,13 +240,19 @@ def _decode_core(raw: bytes) -> Optional["BitchatPacket"]:
             recipient_id = raw[offset:offset + RECIPIENT_ID_SIZE]
             offset += RECIPIENT_ID_SIZE
 
-        if has_route:  # v2 source-routing hops; we don't use them, just skip.
+        route = None
+        if has_route:  # v2 source-routing hops
             if len(raw) < offset + 1:
                 return None
             route_count = raw[offset]
-            offset += 1 + route_count * SENDER_ID_SIZE
-            if len(raw) < offset:
+            offset += 1
+            if len(raw) < offset + route_count * SENDER_ID_SIZE:
                 return None
+            route = []
+            for i in range(route_count):
+                hop = raw[offset:offset + SENDER_ID_SIZE]
+                route.append(bytes(hop))
+                offset += SENDER_ID_SIZE
 
         if is_compressed:
             if payload_length < length_field or len(raw) < offset + payload_length:
@@ -266,7 +281,7 @@ def _decode_core(raw: bytes) -> Optional["BitchatPacket"]:
         return BitchatPacket(
             type=msg_type, sender_id=sender_id, recipient_id=recipient_id,
             timestamp=timestamp, payload=payload, signature=signature,
-            ttl=ttl, version=version,
+            ttl=ttl, version=version, route=route,
         )
     except (struct.error, ValueError, IndexError):
         return None

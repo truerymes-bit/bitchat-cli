@@ -189,6 +189,36 @@ class ChatState:
                         edges.append((a, b))
         return edges
 
+    def compute_route(self, sender_hex: str, recipient_hex: str) -> list:
+        """Compute a source route (intermediate hops) through confirmed edges.
+
+        Uses BFS over confirmed edges. Returns list of intermediate peer IDs
+        (excluding sender and recipient), or empty list if no path / direct.
+        """
+        if sender_hex == recipient_hex:
+            return []
+        # Build adjacency from confirmed edges
+        adj = {}
+        for a, b in self.confirmed_edges():
+            adj.setdefault(a, set()).add(b)
+            adj.setdefault(b, set()).add(a)
+
+        # BFS
+        from collections import deque
+        visited = {sender_hex}
+        queue = deque([(sender_hex, [])])
+        while queue:
+            node, path = queue.popleft()
+            for neighbor in adj.get(node, set()):
+                if neighbor == recipient_hex:
+                    # Found path; path contains intermediate hops so far
+                    # path is from sender to node; neighbor is recipient
+                    return path  # intermediate hops (node is last intermediate)
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    queue.append((neighbor, path + [neighbor]))
+        return []  # no path found
+
     def remove_peer(self, peer_id_hex: str):
         self.peer_nicknames.pop(peer_id_hex, None)
         self.peer_info.pop(peer_id_hex, None)

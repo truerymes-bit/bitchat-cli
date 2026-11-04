@@ -20,7 +20,7 @@ class CLI:
         self.ble_service = BLEService(state, self.redraw_prompt)
         self.session = PromptSession(
             completer=WordCompleter(
-                ["/w", "/peers", "/dm", "/verify", "/unverify", "/name", "/send", "/file", "/clear", "/sync", "/topology", "/help"], ignore_case=True
+                ["/w", "/peers", "/dm", "/route", "/verify", "/unverify", "/name", "/send", "/file", "/clear", "/sync", "/topology", "/help"], ignore_case=True
             )
         )
 
@@ -91,6 +91,21 @@ class CLI:
                     self._out(theme.warn(f"No peer matching '{peer_prefix}'"))
                 else:
                     await self.ble_service.send_private_message(target, msg)
+        elif cmd == "/route":
+            if len(parts) < 3:
+                self._out(theme.warn("Usage: /route <peer_id_prefix> <message>"))
+            else:
+                peer_prefix = parts[1]
+                msg = " ".join(parts[2:])
+                target = None
+                for pid in self.state.peer_info:
+                    if pid.startswith(peer_prefix):
+                        target = pid
+                        break
+                if target is None:
+                    self._out(theme.warn(f"No peer matching '{peer_prefix}'"))
+                else:
+                    await self.ble_service.send_routed_message(target, msg)
         elif cmd == "/verify":
             if len(parts) < 2:
                 self._out(theme.warn("Usage: /verify <peer_id_prefix>"))
@@ -181,6 +196,7 @@ class CLI:
                 ("/w", "List known peers."),
                 ("/peers", "List verified peers with keys."),
                 ("/dm <id> <msg>", "Send encrypted private message."),
+                ("/route <id> <msg>", "Send message via source-routed path."),
                 ("/verify <id>", "Mark a peer as verified (after comparing fingerprints)."),
                 ("/unverify <id>", "Remove verification from a peer."),
                 ("/name <nick>", "Change your nickname and re-announce."),

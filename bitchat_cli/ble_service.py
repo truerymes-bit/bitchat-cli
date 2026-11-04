@@ -188,6 +188,7 @@ class BLEService:
         self._sync_manager: Optional[GossipSyncManager] = None
         # Map BLE address -> peer_id_hex for direct peers, for cleanup on drop
         self._direct_addr_to_peer: Dict[str, str] = {}
+        self._peer_addr: Dict[str, str] = {}  # peer_id_hex -> BLE address
         # Capacity-bounded seen-set (LRU) for packet dedup, persisted to disk.
         from collections import OrderedDict
         import threading
@@ -574,6 +575,7 @@ class BLEService:
             signature=packet.signature,
             ttl=packet.ttl - 1,
             version=packet.version,
+            route=packet.route,
         )
         peers = [a for a in self.clients.keys() if a != ingress and self.clients[a].is_connected]
         if not peers:
@@ -587,9 +589,37 @@ class BLEService:
             rng = random.Random(seed)
             rng.shuffle(peers)
             peers = peers[:fanout_count]
-        import random as _r
-        jitter = _r.uniform(0.010, 0.220)
-        asyncio.ensure_future(self._relay_after_delay(relay_packet, peers, jitter))
+        # Source routing (v2): if packet has a route and we're in it,
+        # unicast to the next hop instead of flooding.
+        use_unicast = False
+        unicast_addr = None
+        if packet.route and packet.version >= 2 and packet.recipient_id is not None:
+            my_id = bytes(self.state.my_peer_id)
+            route = [bytes(h) for h in packet.route]
+            idx = None
+            for i, hop in enumerate(route):
+                if hop == my_id:
+                    idx = i
+                    break
+            if idx is not None:
+                # Determine next hop
+                if idx + 1 < len(route):
+                    next_hop_id = route[idx + 1].hex()
+                else:
+                    next_hop_id = bytes(packet.recipient_id).hex()
+                # Look up BLE address for next hop
+                addr = self._peer_addr.get(next_hop_id)
+                if addr and addr in self.clients and self.clients[addr].is_connected:
+                    use_unicast = True
+                    unicast_addr = addr
+
+        if use_unicast and unicast_addr:
+            # Unicast to next hop only
+            asyncio.ensure_future(self._unicast_after_delay(relay_packet, unicast_addr, 0.010))
+        else:
+            import random as _r
+            jitter = _r.uniform(0.010, 0.220)
+            asyncio.ensure_future(self._relay_after_delay(relay_packet, peers, jitter))
 
     async def _relay_after_delay(self, packet: BitchatPacket, peers: list, delay: float):
         await asyncio.sleep(delay)
@@ -601,6 +631,21 @@ class BLEService:
                     await client.write_gatt_char(CHARACTERISTIC_UUID, encoded, response=False)
                 except Exception:
                     pass
+        if self._peripheral is not None:
+            try:
+                self._peripheral.notify_all(encoded)
+            except Exception:
+                pass
+
+    async def _unicast_after_delay(self, packet: BitchatPacket, addr: str, delay: float):
+        await asyncio.sleep(delay)
+        encoded = packet.encode()
+        client = self.clients.get(addr)
+        if client and client.is_connected:
+            try:
+                await client.write_gatt_char(CHARACTERISTIC_UUID, encoded, response=False)
+            except Exception:
+                pass
         if self._peripheral is not None:
             try:
                 self._peripheral.notify_all(encoded)
@@ -648,6 +693,10 @@ class BLEService:
         )
         # Phase 5: update topology from direct neighbors TLV (even if empty)
         self.state.update_topology(peer_id, ann.direct_neighbors or [], timestamp=packet.timestamp)
+        # Track peer -> BLE address mapping (for source routing unicast)
+        if ingress is not None:
+            self._peer_addr[peer_id] = ingress
+
         # Track as direct peer only if received over a direct BLE link.
         # Require a first-hop announce (ttl == DEFAULT_TTL): relayed or
         # gossip-synced announces (ttl < DEFAULT_TTL / ttl == 0) must not
@@ -706,6 +755,7 @@ class BLEService:
         nickname = self.state.nickname_for(peer_id)
         self.state.remove_peer(peer_id)
         self.state.remove_direct_peer(peer_id)
+        self._peer_addr.pop(peer_id, None)
         if self._sync_manager is not None:
             try:
                 self._sync_manager.remove_announcement_for_peer(peer_id)
@@ -801,6 +851,37 @@ class BLEService:
         await self._broadcast(packet)
         if self._sync_manager is not None:
             self._sync_manager.record_packet(packet)
+        message = BitchatMessage(content=content, sender=self.state.nickname)
+        self.state.add_message(message)
+        self._chat(self.state.nickname, content, is_self=True)
+        return message
+
+    async def send_routed_message(self, recipient_hex: str, content: str):
+        """Send a message to a specific recipient via source routing.
+
+        Computes a route through confirmed edges. If no route is found,
+        falls back to normal broadcast (flood).
+        """
+        recipient_bytes = bytes.fromhex(recipient_hex)
+        route_ids = self.state.compute_route(self.state.my_peer_id.hex(), recipient_hex)
+        route_bytes = [bytes.fromhex(h) for h in route_ids] if route_ids else None
+        packet = self._sign(BitchatPacket(
+            type=MessageType.MESSAGE,
+            sender_id=self.state.my_peer_id,
+            recipient_id=recipient_bytes,
+            payload=content.encode("utf-8"),
+            ttl=DEFAULT_TTL,
+            version=2,
+            route=route_bytes,
+        ))
+        await self._broadcast(packet)
+        if self._sync_manager is not None:
+            self._sync_manager.record_packet(packet)
+        if route_bytes:
+            hops = " -> ".join([self.state.my_peer_id.hex()[:8]] + [h[:8] for h in route_ids] + [recipient_hex[:8]])
+            self._sys(f"Routed via: {hops}")
+        else:
+            self._sys("No route found - broadcasting (flood).")
         message = BitchatMessage(content=content, sender=self.state.nickname)
         self.state.add_message(message)
         self._chat(self.state.nickname, content, is_self=True)

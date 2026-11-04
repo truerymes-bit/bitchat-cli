@@ -15,10 +15,9 @@ A fork of **bitchat-cli** (original: https://github.com/dearabhin/bitchat-cli) w
 - Packet relay with dedup, jitter, TTL decrement, split-horizon (Phase 1)
 - Peer signature verification (Phase 2)
 - Gossip sync (Phase 4) — GCS filter sync, REQUEST_SYNC, initial/periodic sync, announcement retention/pruning
-- Neighbor gossip (Phase 5 partial) — TLV 0x04 in ANNOUNCE, mesh graph tracking, confirmed/unconfirmed edges, /topology command
+- Topology/routing (Phase 5 complete) — TLV 0x04 neighbor gossip, mesh graph tracking, confirmed/unconfirmed edges, source routing (v2 HAS_ROUTE, BFS path, relay-by-route), /topology and /route commands
 
 ### What's NOT implemented
-- Source routing (Phase 5) — v2 HAS_ROUTE, route list, relay-by-route, route calculation
 - BLE peripheral advertising (not discoverable when idle)
 
 ### What IS implemented (relay)
