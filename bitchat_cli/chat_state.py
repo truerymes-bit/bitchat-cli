@@ -1,4 +1,5 @@
 # chat_state.py
+import hashlib
 import json
 import os
 from typing import Dict, List, Set, Optional
@@ -11,10 +12,15 @@ VERIFIED_PATH = os.path.expanduser("~/.bitchat/verified_peers.json")
 
 class ChatState:
     """In-memory application state shared between the CLI and the BLE service."""
-    def __init__(self, nickname: str, my_peer_id: bytes):
-        self.nickname = nickname
-        self.my_peer_id = my_peer_id              # 8 random bytes
+    def __init__(self, nickname: str = "", my_peer_id: Optional[bytes] = None):
         self.identity = IdentityKeys()
+        if my_peer_id is None:
+            self.my_peer_id = hashlib.sha256(self.identity.noise_public_key_bytes()).digest()[:8]
+        else:
+            self.my_peer_id = my_peer_id
+        if not nickname:
+            nickname = f"user-{self.my_peer_id.hex()[:4]}"
+        self.nickname = nickname
         self.messages: List[BitchatMessage] = []
 
         # Peers are identified by their 8-byte peer ID (hex), learned from

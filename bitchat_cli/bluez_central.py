@@ -227,9 +227,11 @@ class BluezClient:
             def __init__(self, uuid):
                 self.uuid = uuid
         class Service:
-            def __init__(self):
-                self.characteristics = [Char(CHARACTERISTIC_UUID)]
-        return [Service()]
+            def __init__(self, chars):
+                self.characteristics = chars
+        if self._char_iface:
+            return [Service([Char(CHARACTERISTIC_UUID)])]
+        return []
 
     async def start_notify(self, char_uuid: str, callback: Callable):
         self._notify_callback = callback
@@ -241,11 +243,9 @@ class BluezClient:
                     raise
 
     async def write_gatt_char(self, char_uuid: str, data: bytes, response: bool = False):
-        if self._char_iface:
-            try:
-                await self._char_iface.call_write_value(bytes(data), {})
-            except Exception:
-                pass
+        if self._char_iface is None:
+            raise RuntimeError(f"{self.address}: characteristic never resolved")
+        await self._char_iface.call_write_value(bytes(data), {})
 
     async def disconnect(self):
         self._connected = False
