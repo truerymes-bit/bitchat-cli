@@ -132,12 +132,13 @@ class ChatState:
         if timestamp > 0:
             self._topology_ts[peer_id_hex] = timestamp
         neighbor_ids = set()
+        my_id = self.my_peer_id.hex()[:16]
         for nid_bytes in neighbors[:10]:
             nid_hex = bytes(nid_bytes).hex()
             if len(nid_hex) >= 16:
                 nid_hex = nid_hex[:16]
-                # Filter self-loop
-                if nid_hex == peer_id_hex:
+                # Filter self-loop (peer announcing itself or the CLI itself)
+                if nid_hex == peer_id_hex or nid_hex == my_id:
                     continue
                 neighbor_ids.add(nid_hex)
         self.topology[peer_id_hex] = neighbor_ids
@@ -152,8 +153,13 @@ class ChatState:
         """Return list of (peer_a, peer_b) tuples that are confirmed (bidirectional)."""
         edges = []
         seen = set()
+        my_id = self.my_peer_id.hex()[:16]
         for a, neighbors in self.topology.items():
+            if a == my_id:
+                continue
             for b in neighbors:
+                if b == my_id:
+                    continue
                 if b in self.topology and a in self.topology.get(b, set()):
                     key = tuple(sorted([a, b]))
                     if key not in seen:
@@ -165,8 +171,13 @@ class ChatState:
         """Return list of (peer_a, peer_b) where only one side announced."""
         edges = []
         seen = set()
+        my_id = self.my_peer_id.hex()[:16]
         for a, neighbors in self.topology.items():
+            if a == my_id:
+                continue
             for b in neighbors:
+                if b == my_id:
+                    continue
                 if b not in self.topology or a not in self.topology.get(b, set()):
                     key = tuple(sorted([a, b]))
                     if key not in seen:
