@@ -62,13 +62,18 @@ class BluezScanner:
         # Set discovery filter (optional, may not work on all adapters)
         try:
             await self._adapter_iface.call_set_discovery_filter(
-                {"Transport": Variant("s", "le")}
+                {"Transport": Variant("s", "le"), "UUIDs": Variant("as", [SERVICE_UUID])}
             )
         except Exception:
             try:
-                await self._adapter_iface.call_set_discovery_filter({})
+                await self._adapter_iface.call_set_discovery_filter(
+                    {"Transport": Variant("s", "le")}
+                )
             except Exception:
-                pass
+                try:
+                    await self._adapter_iface.call_set_discovery_filter({})
+                except Exception:
+                    pass
 
         # Listen for InterfacesAdded
         om_introspection = await self._bus.introspect("org.bluez", "/")

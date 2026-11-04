@@ -280,8 +280,6 @@ class BLEService:
             self.clients[addr] = client
             self.state.add_connection(addr)
             await client.start_notify(CHARACTERISTIC_UUID, self._on_notify)
-            with open("/tmp/notify-debug.log", "a") as f:
-                f.write(f"NOTIFY_SUBSCRIBED: {addr}\n")
             self._ok(f"Connected to a bitchat peer ({addr}).")
             await self.send_announce()  # introduce ourselves so they list us
         except (asyncio.TimeoutError, Exception) as e:
