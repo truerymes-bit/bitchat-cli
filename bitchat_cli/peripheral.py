@@ -59,9 +59,8 @@ class BitchatPeripheral:
                     packet = BitchatPacket.decode(bytes(data))
                     if packet is not None:
                         outer.dispatch_fn(packet, addr)
-                except Exception as e:
-                    with open("/tmp/peripheral-debug.log", "a") as f:
-                        f.write(f"PERIPHERAL_ERR: {e}\n")
+                except Exception:
+                    pass
 
         self._service = BitchatService()
         await self._service.register(self._bus)
@@ -76,6 +75,7 @@ class BitchatPeripheral:
             timeout=0,
             discoverable=True,
             packet_type=PacketType.PERIPHERAL,
+            includes=AdvertisingIncludes.TX_POWER,
         )
         adapter = await Adapter.get_first(self._bus)
         await self._advert.register(self._bus, adapter)
