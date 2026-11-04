@@ -34,8 +34,9 @@ Fork of [bitchat-cli](https://github.com/dearabhin/bitchat-cli) v0.2.3 with sign
 - RSSI tracking and peer-switching (disabled — was dropping connected peers)
 - Connect lock / RSSI filter reversion (was blocking discovery)
 - Disconnect cooldown (30s) to break reconnect loops
-- Peer ID derivation from Noise public key (was random, phones dropped packets)
-- ANNOUNCE throttle and announce-on-connect
+- Peer ID derivation from Noise public key (was random, phones dropped packets) — restored after regression
+- BlueZ write_gatt_char now raises on failure instead of swallowing errors
+- BlueZ services property returns real characteristic state (was hardcoded)
 
 ### Not yet implemented
 - Phase 4: Advanced gossip sync for missed messages
