@@ -19,6 +19,24 @@ import time
 from pathlib import Path
 from typing import Dict, List, Set, Optional
 
+import logging
+logging.getLogger("dbus_next").setLevel(logging.CRITICAL)
+logging.getLogger("bluez_peripheral").setLevel(logging.CRITICAL)
+
+class _TxPowerFilter(logging.Filter):
+    def filter(self, record):
+        return "TxPower" not in record.getMessage()
+
+import builtins
+_orig_print = builtins.print
+def _quiet_print(*args, **kwargs):
+    msg = " ".join(str(a) for a in args)
+    if "TxPower" in msg or "Unrecognised exception" in msg or "UnknownProperty" in msg:
+        return
+    _orig_print(*args, **kwargs)
+builtins.print = _quiet_print
+logging.getLogger().addFilter(_TxPowerFilter())
+
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from cryptography.hazmat.primitives import serialization
 from cryptography.exceptions import InvalidSignature

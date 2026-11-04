@@ -3,6 +3,15 @@
 # Uses dbus_next to talk directly to BlueZ.
 
 import asyncio
+import logging
+logging.getLogger("dbus_next").setLevel(logging.CRITICAL)
+
+class _TxPowerFilter(logging.Filter):
+    def filter(self, record):
+        return "TxPower" not in record.getMessage()
+
+logging.getLogger().addFilter(_TxPowerFilter())
+
 from dbus_next.aio import MessageBus
 from dbus_next import BusType, Variant
 from dbus_next.errors import DBusError
