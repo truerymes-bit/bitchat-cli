@@ -59,7 +59,7 @@ Fork of [bitchat-cli](https://github.com/dearabhin/bitchat-cli) v0.2.3 with sign
 - **Commands**: `/topology` to display mesh graph, `/route <id> <msg>` to send via source-routed path
 
 ### Not yet implemented
-- (removed: peripheral advertising is implemented)
+- (none — all planned features implemented)
 
 ### Credits
 - Original project: [bitchat-cli](https://github.com/dearabhin/bitchat-cli) by Abhin

@@ -102,6 +102,7 @@ class NoiseSession:
         self._recv_key = None
         self._send_counter = 0
         self._recv_window = set()  # simplified: track seen counters
+        self._last_error = None
 
     @property
     def is_finished(self) -> bool:
@@ -138,7 +139,7 @@ class NoiseSession:
                 self._extract_transport_keys()
                 return None
         except Exception as e:
-            self._last_error = str(e)
+            self._last_error = str(e) or type(e).__name__
             return None
 
     def encrypt(self, plaintext: bytes) -> bytes:
@@ -443,9 +444,15 @@ class BLEService:
         if packet.type == MessageType.FRAGMENT:
             if packet.ttl > 1:
                 self._schedule_relay(packet, ingress, packet_id)
-                # Track that this fragment train was relayed, so the reassembled
-                # inner packet is not relayed again (dedup won't catch it).
-                self._relayed_fragments.add(packet_id)
+                # Track fragment_id so the reassembled inner packet is not re-relayed.
+                # Fragment payload: fragment_id(8) + index(2) + total(2) + type(1) + chunk
+                if len(packet.payload) >= 13:
+                    frag_id = packet.payload[:8]
+                    key = (bytes(packet.sender_id), frag_id)
+                    self._relayed_fragments.add(key)
+                    # Bound the set
+                    if len(self._relayed_fragments) > 1000:
+                        self._relayed_fragments.clear()
             inner = self._reassembler.add(packet)
             if inner is not None:
                 reassembled = BitchatPacket.decode(inner)
@@ -460,10 +467,16 @@ class BLEService:
                     except (OverflowError, ValueError, TypeError, AttributeError):
                         rid.update((0).to_bytes(8, 'big'))
                     rid.update(reassembled.payload)
-                    rid = rid.digest()[:16]
-                    if rid in self._relayed_fragments:
+                    # Check if fragments from this sender were already relayed.
+                    # _relayed_fragments stores (sender_id, fragment_id) tuples.
+                    # Since reassembled packet loses fragment_id, check by sender_id.
+                    sender_key = bytes(reassembled.sender_id)
+                    already_relayed = any(k[0] == sender_key for k in self._relayed_fragments)
+                    if already_relayed:
                         # Fragments already relayed; only dispatch, don't relay again
                         self._dispatch_no_relay(reassembled, ingress)
+                        # Clean up entries for this sender
+                        self._relayed_fragments = {k for k in self._relayed_fragments if k[0] != sender_key}
                     else:
                         self._dispatch(reassembled, ingress)
             return
