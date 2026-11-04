@@ -28,7 +28,8 @@ Fork of [bitchat-cli](https://github.com/dearabhin/bitchat-cli) v0.2.3 with sign
 
 ### Fixed
 - Peripheral WriteValue setter signature (removed `self` for 3-arg convention)
-- TxPower property error suppression
+- TxPower property error: now includes `AdvertisingIncludes.TX_POWER` in advertisement instead of only suppressing the error
+- TxPower/bluez_peripheral print suppression (defense in depth)
 - RSSI tracking and peer-switching (disabled — was dropping connected peers)
 - Connect lock / RSSI filter reversion (was blocking discovery)
 - Disconnect cooldown (30s) to break reconnect loops
