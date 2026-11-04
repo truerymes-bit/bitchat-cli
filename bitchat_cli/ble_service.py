@@ -561,8 +561,8 @@ class BLEService:
         if self._sync_manager is not None and packet.type in (MessageType.ANNOUNCE, MessageType.MESSAGE):
             self._sync_manager.record_packet(packet)
 
-        # Relay
-        if packet.ttl > 1:
+        # Relay (skip if this packet is addressed to us — we are the final destination)
+        if packet.ttl > 1 and packet.recipient_id != self.state.my_peer_id:
             self._schedule_relay(packet, ingress, packet_id)
 
     def _schedule_relay(self, packet: BitchatPacket, ingress: str = None, packet_id: bytes = None):
@@ -640,17 +640,22 @@ class BLEService:
     async def _unicast_after_delay(self, packet: BitchatPacket, addr: str, delay: float):
         await asyncio.sleep(delay)
         encoded = packet.encode()
+        fragmented = len(encoded) > MAX_FRAME_SIZE
+        frames = self._fragment(encoded, packet.type, packet.version, packet.route) if fragmented else [encoded]
         client = self.clients.get(addr)
-        if client and client.is_connected:
-            try:
-                await client.write_gatt_char(CHARACTERISTIC_UUID, encoded, response=False)
-            except Exception:
-                pass
-        if self._peripheral is not None:
-            try:
-                self._peripheral.notify_all(encoded)
-            except Exception:
-                pass
+        for frame in frames:
+            if client and client.is_connected:
+                try:
+                    await client.write_gatt_char(CHARACTERISTIC_UUID, frame, response=False)
+                except Exception:
+                    pass
+            if self._peripheral is not None:
+                try:
+                    self._peripheral.notify_all(frame)
+                except Exception:
+                    pass
+            if fragmented:
+                await asyncio.sleep(FRAGMENT_PACING)
 
     def _verify_signature(self, packet: BitchatPacket, signing_key_bytes: bytes) -> bool:
         """Verify Ed25519 signature on a packet. Returns True if valid."""
@@ -689,10 +694,15 @@ class BLEService:
         peer_id = packet.sender_id.hex()
         # Store peer verification info (key consistency check)
         is_new = self.state.set_peer_info(
-            peer_id, ann.nickname, ann.noise_public_key, ann.signing_public_key
+            peer_id, ann.nickname, ann.noise_public_key, ann.signing_public_key,
+            capabilities=getattr(ann, "capabilities", 0),
         )
         # Phase 5: update topology from direct neighbors TLV (even if empty)
-        self.state.update_topology(peer_id, ann.direct_neighbors or [], timestamp=packet.timestamp)
+        # Gating: only update topology for verified peers or first announce (TOFU).
+        # Subsequent announces from unverified peers don't change topology.
+        is_verified = self.state.is_verified(peer_id)
+        if is_new or is_verified:
+            self.state.update_topology(peer_id, ann.direct_neighbors or [], timestamp=packet.timestamp)
         # Track peer -> BLE address mapping (for source routing unicast)
         if ingress is not None:
             self._peer_addr[peer_id] = ingress
@@ -972,7 +982,7 @@ class BLEService:
     async def _broadcast(self, packet: BitchatPacket):
         encoded = packet.encode()
         fragmented = len(encoded) > MAX_FRAME_SIZE
-        frames = self._fragment(encoded, packet.type) if fragmented else [encoded]
+        frames = self._fragment(encoded, packet.type, packet.version, packet.route) if fragmented else [encoded]
         failed = []  # (addr, reason) of links to tear down after this pass
         for addr, client in list(self.clients.items()):
             if not client.is_connected:
@@ -1033,7 +1043,7 @@ class BLEService:
         self._leave(f"Lost connection to {addr}" + (f" ({reason})" if reason else ""))
         await self._safe_disconnect(client)
 
-    def _fragment(self, encoded_packet: bytes, original_type: int) -> List[bytes]:
+    def _fragment(self, encoded_packet: bytes, original_type: int, version: int = 1, route: list = None) -> List[bytes]:
         """Split an oversized encoded packet into FRAGMENT packets."""
         fragment_id = os.urandom(8)
         chunk_size = MAX_FRAME_SIZE - 40  # room for fragment + packet headers
@@ -1047,6 +1057,7 @@ class BLEService:
             frag = BitchatPacket(
                 type=MessageType.FRAGMENT, sender_id=self.state.my_peer_id,
                 recipient_id=None, payload=payload, ttl=DEFAULT_TTL,
+                version=version, route=route,
             )
             # Encode WITHOUT padding: PKCS#7 padding would round a ~475-byte
             # fragment up to a 512-byte block, which can exceed the negotiated

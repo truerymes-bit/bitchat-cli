@@ -62,7 +62,8 @@ class ChatState:
         return is_new
 
     def set_peer_info(self, peer_id_hex: str, nickname: str,
-                      noise_public_key: bytes, signing_public_key: bytes) -> bool:
+                      noise_public_key: bytes, signing_public_key: bytes,
+                      capabilities: int = 0) -> bool:
         """Store peer verification info from ANNOUNCE. Returns True if new/changed.
         Key consistency: if peer already exists with different noise key, reject."""
         existing = self.peer_info.get(peer_id_hex)
@@ -72,6 +73,7 @@ class ChatState:
                 return False  # key mismatch — reject
             # Update nickname if changed
             existing["nickname"] = nickname
+            existing["capabilities"] = capabilities
             self.peer_nicknames[peer_id_hex] = nickname
             return False  # already known
         # New peer
@@ -79,6 +81,7 @@ class ChatState:
             "nickname": nickname,
             "noise_public_key": noise_public_key,
             "signing_public_key": signing_public_key,
+            "capabilities": capabilities,
         }
         self.peer_nicknames[peer_id_hex] = nickname
         return True
@@ -202,6 +205,11 @@ class ChatState:
         for a, b in self.confirmed_edges():
             adj.setdefault(a, set()).add(b)
             adj.setdefault(b, set()).add(a)
+        # Include self's direct BLE connections (self is excluded from topology)
+        my_id = self.my_peer_id.hex()[:16]
+        for dp in self.direct_peers:
+            adj.setdefault(my_id, set()).add(dp)
+            adj.setdefault(dp, set()).add(my_id)
 
         # BFS
         from collections import deque

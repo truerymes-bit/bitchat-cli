@@ -130,7 +130,7 @@ class BitchatPacket:
             flags |= PacketFlags.HAS_RECIPIENT
         if self.signature is not None:
             flags |= PacketFlags.HAS_SIGNATURE
-        if self.route and self.version >= 2:
+        if self.route and self.version >= 2 and self.recipient_id is not None:
             flags |= PacketFlags.HAS_ROUTE
 
         sender = self.sender_id[:SENDER_ID_SIZE].ljust(SENDER_ID_SIZE, b"\x00")
@@ -156,7 +156,8 @@ class BitchatPacket:
         if self.recipient_id is not None:
             data += self.recipient_id[:RECIPIENT_ID_SIZE].ljust(RECIPIENT_ID_SIZE, b"\x00")
         # Source route (v2 only): Count (1 byte) + Hops (N * 8 bytes)
-        if self.route and self.version >= 2:
+        # Only valid when recipient_id is present
+        if self.route and self.version >= 2 and self.recipient_id is not None:
             hops = [h[:SENDER_ID_SIZE].ljust(SENDER_ID_SIZE, b"\x00") for h in self.route]
             data += len(hops).to_bytes(1, "big")
             for h in hops:
@@ -241,7 +242,7 @@ def _decode_core(raw: bytes) -> Optional["BitchatPacket"]:
             offset += RECIPIENT_ID_SIZE
 
         route = None
-        if has_route:  # v2 source-routing hops
+        if has_route and has_recipient:  # v2 source-routing hops (requires recipient)
             if len(raw) < offset + 1:
                 return None
             route_count = raw[offset]
@@ -311,6 +312,7 @@ class _AnnTLV:
     NOISE_PUBKEY = 0x02
     SIGNING_PUBKEY = 0x03
     DIRECT_NEIGHBORS = 0x04
+    CAPABILITIES = 0x05
 
 
 @dataclass
@@ -319,6 +321,7 @@ class AnnouncementPacket:
     noise_public_key: bytes      # X25519 static key, 32 bytes
     signing_public_key: bytes    # Ed25519 signing key, 32 bytes
     direct_neighbors: list = field(default_factory=list)  # list of 8-byte peer IDs (TLV 0x04)
+    capabilities: int = 0  # TLV 0x05: feature bitfield (little-endian)
 
     def encode(self) -> Optional[bytes]:
         nick_b = self.nickname.encode("utf-8")
@@ -357,6 +360,8 @@ class AnnouncementPacket:
     @staticmethod
     def decode(data: bytes) -> Optional["AnnouncementPacket"]:
         nickname = noise = signing = None
+        direct_neighbors = []
+        capabilities = 0
         o = 0
         while o + 2 <= len(data):
             tlv_type = data[o]; length = data[o + 1]; o += 2
@@ -369,7 +374,7 @@ class AnnouncementPacket:
                 noise = bytes(value)
             elif tlv_type == _AnnTLV.SIGNING_PUBKEY:
                 signing = bytes(value)
-            elif tlv_type == _AnnTLV.DIRECT_NEIGHBORS and 'direct_neighbors' not in locals():
+            elif tlv_type == _AnnTLV.DIRECT_NEIGHBORS:
                 # Parse neighbor list: length/8 peer IDs, 8 bytes each (max 10)
                 neighbors = []
                 o2 = 0
@@ -377,13 +382,19 @@ class AnnouncementPacket:
                     nid = bytes(value[o2:o2 + 8])
                     neighbors.append(nid)
                     o2 += 8
-                direct_neighbors = neighbors
+                if not direct_neighbors and neighbors:  # first-wins
+                    direct_neighbors = neighbors
+            elif tlv_type == _AnnTLV.CAPABILITIES:
+                # Parse as little-endian bitfield
+                if len(value) > 0:
+                    capabilities = int.from_bytes(value, "little")
             # unknown TLVs skipped for forward-compat
         if nickname is None or noise is None or signing is None:
             return None
         return AnnouncementPacket(nickname=nickname, noise_public_key=noise,
                                   signing_public_key=signing,
-                                  direct_neighbors=direct_neighbors if 'direct_neighbors' in locals() else [])
+                                  direct_neighbors=direct_neighbors,
+                                  capabilities=capabilities)
 
 
 # --------------------------------------------------------------------------- #

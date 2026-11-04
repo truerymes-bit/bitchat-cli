@@ -98,7 +98,9 @@ class CLI:
                 peer_prefix = parts[1]
                 msg = " ".join(parts[2:])
                 target = None
-                for pid in self.state.peer_info:
+                # Resolve from all known peers (peer_info first, then peer_nicknames)
+                candidates = list(self.state.peer_info.keys()) + [p for p in self.state.peer_nicknames if p not in self.state.peer_info]
+                for pid in candidates:
                     if pid.startswith(peer_prefix):
                         target = pid
                         break
