@@ -49,19 +49,7 @@ class ChatState:
 
     def save_nickname(self):
         """Persist the current nickname to identity.json."""
-        try:
-            import json
-            from pathlib import Path
-            ident_path = Path.home() / ".bitchat" / "identity.json"
-            data = {}
-            if ident_path.exists():
-                with open(ident_path) as f:
-                    data = json.load(f)
-            data["nickname"] = self.nickname
-            with open(ident_path, "w") as f:
-                json.dump(data, f, indent=2)
-        except OSError:
-            pass
+        self.identity.save_nickname(self.nickname)
 
     def add_message(self, message: BitchatMessage):
         self.messages.append(message)
