@@ -137,6 +137,7 @@ class CLI:
             else:
                 old = self.state.nickname
                 self.state.nickname = new_nick
+                self.state.save_nickname()
                 await self.ble_service.send_announce()
                 self._out(theme.system(f"Nickname changed from '{old}' to '{new_nick}'."))
         elif cmd in ("/send", "/file"):

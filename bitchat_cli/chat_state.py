@@ -19,7 +19,7 @@ class ChatState:
         else:
             self.my_peer_id = my_peer_id
         if not nickname:
-            nickname = f"user-{self.my_peer_id.hex()[:4]}"
+            nickname = self.identity.nickname
         self.nickname = nickname
         self.messages: List[BitchatMessage] = []
 
@@ -46,6 +46,22 @@ class ChatState:
     @property
     def my_peer_id_hex(self) -> str:
         return self.my_peer_id.hex()
+
+    def save_nickname(self):
+        """Persist the current nickname to identity.json."""
+        try:
+            import json
+            from pathlib import Path
+            ident_path = Path.home() / ".bitchat" / "identity.json"
+            data = {}
+            if ident_path.exists():
+                with open(ident_path) as f:
+                    data = json.load(f)
+            data["nickname"] = self.nickname
+            with open(ident_path, "w") as f:
+                json.dump(data, f, indent=2)
+        except OSError:
+            pass
 
     def add_message(self, message: BitchatMessage):
         self.messages.append(message)
