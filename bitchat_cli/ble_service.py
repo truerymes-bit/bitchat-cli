@@ -79,7 +79,7 @@ MAX_CONNECT_ATTEMPTS = 3        # before a device is permanently ignored
 RETRY_COOLDOWN = 15.0           # seconds to wait before re-attempting a device
 ANNOUNCE_INTERVAL = 30.0        # seconds between periodic re-announces
 MAX_FRAME_SIZE = 480            # bytes before a packet is fragmented for BLE
-FRAGMENT_PACING = 0.005         # seconds between BLE writes when sending a fragment train
+FRAGMENT_PACING = 0.020         # seconds between BLE writes when sending a fragment train
 
 # Where received media (images, voice notes, files) is saved.
 DOWNLOAD_DIR = Path.home() / ".bitchat" / "downloads"
