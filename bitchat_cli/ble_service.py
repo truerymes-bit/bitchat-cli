@@ -941,7 +941,43 @@ class BLEService:
             version=2,
             route=route_bytes,
         ))
-        await self._broadcast(packet)
+        # Delivery: unicast to first hop (if routed) or direct recipient,
+        # falling back to broadcast (flood) when neither is an outbound
+        # connection we can write to.
+        unicast_addr = None
+        if route_ids:  # non-empty route
+            first_hop = route_ids[0]
+            addr = self._peer_addr.get(first_hop)
+            if addr and addr in self.clients and self.clients[addr].is_connected:
+                unicast_addr = addr
+        if unicast_addr is None:
+            addr = self._peer_addr.get(recipient_hex)
+            if addr and addr in self.clients and self.clients[addr].is_connected:
+                unicast_addr = addr
+
+        sent = False
+        if unicast_addr is not None:
+            encoded = packet.encode()
+            fragmented = len(encoded) > MAX_FRAME_SIZE
+            frames = self._fragment(encoded, packet.type, packet.version, packet.route) if fragmented else [encoded]
+            client = self.clients.get(unicast_addr)
+            ok = True
+            for frame in frames:
+                if client and client.is_connected:
+                    try:
+                        await client.write_gatt_char(CHARACTERISTIC_UUID, frame, response=False)
+                    except Exception:
+                        ok = False
+                        break
+                else:
+                    ok = False
+                    break
+                if fragmented:
+                    await asyncio.sleep(FRAGMENT_PACING)
+            if ok:
+                sent = True
+        if not sent:
+            await self._broadcast(packet)
         if self._sync_manager is not None:
             self._sync_manager.record_packet(packet)
         if route_ids is None:
