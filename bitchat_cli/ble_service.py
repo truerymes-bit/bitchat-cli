@@ -1055,7 +1055,8 @@ class BLEService:
             self._warn(f"'{p.name}' could not be encoded for transfer. Not sent.")
             return
 
-        if not self.clients:
+        has_peers = bool(self.clients) or (self._peripheral is not None and bool(self._peripheral.connected_addresses))
+        if not has_peers:
             self._warn(f"No peers connected yet — '{p.name}' not sent. "
                        f"Wait until a peer is online, then try again.")
             return
