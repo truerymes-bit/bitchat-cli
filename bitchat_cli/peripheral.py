@@ -79,8 +79,8 @@ class BitchatPeripheral:
                         outer._addr_last_seen[addr] = _t.monotonic()
                     if packet is not None:
                         outer.dispatch_fn(packet, addr)
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"PERIPHERAL_WRITE_ERROR: {e}", flush=True)
 
         self._service = BitchatService()
         await self._service.register(self._bus)
