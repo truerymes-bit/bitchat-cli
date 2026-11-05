@@ -529,21 +529,19 @@ class BLEService:
                 # Parse wire format as bytes: \x01\x00$<UUID>\x01<len><content>
                 # Type byte: \x01 = DM, \x02 = delivery receipt, \x03 = read receipt
                 # Don't decode entire plaintext as UTF-8 (length byte may be >= 0x80)
-                if len(plaintext) < 40:
+                if len(plaintext) < 10:
                     return
-                msg_type = chr(plaintext[0]) if plaintext[0] < 128 else ''
-                # Find UUID and length byte (offset 38 = \x01 marker, 39 = length)
-                # Format: type(1) + 0x00(1) + $(1) + UUID(36) + 0x01(1) + len(1) + content
-                if plaintext[1] != 0 or plaintext[2] != ord('$'):
+                msg_type_byte = plaintext[0]
+                msg_type = chr(msg_type_byte) if msg_type_byte < 128 else ''
+                # Use bytes regex to find UUID + length marker (robust to format variations)
+                import re as _re
+                m = _re.search(
+                    rb'\$[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\x01(.)',
+                    plaintext, _re.DOTALL)
+                if not m:
                     return
-                # UUID is 36 chars at offset 3
-                uuid_end = 3 + 36
-                if uuid_end + 2 > len(plaintext):
-                    return
-                if plaintext[uuid_end] != 0x01:
-                    return
-                content_len = plaintext[uuid_end + 1]
-                content_start = uuid_end + 2
+                content_len = m.group(1)[0]
+                content_start = m.end()
                 content_bytes = plaintext[content_start:content_start + content_len]
                 try:
                     content = content_bytes.decode('utf-8')
