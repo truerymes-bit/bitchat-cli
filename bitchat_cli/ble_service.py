@@ -50,6 +50,7 @@ from prompt_toolkit import print_formatted_text
 from prompt_toolkit.formatted_text import ANSI
 
 from . import theme
+from .debuglog import dlog
 from .chat_state import ChatState
 from .media import (
     BitchatFilePacket,
@@ -84,6 +85,18 @@ FRAGMENT_PACING = 0.020         # seconds between BLE writes when sending a frag
 # Where received media (images, voice notes, files) is saved.
 DOWNLOAD_DIR = Path.home() / ".bitchat" / "downloads"
 SEEN_PATH = Path.home() / ".bitchat" / "seen_packets.json"
+DM_SESSION_MAX_AGE = 15.0     # seconds before a DM triggers a fresh handshake
+HS_RETRY_INTERVAL = 10.0      # seconds between background handshake retries
+HS_RETRY_MAX = 6              # max background retries per peer
+WRITE_RETRIES = 3             # retries for a BLE write that fails with 'In Progress'
+WRITE_RETRY_DELAY = 0.05      # seconds between those retries
+DM_HANDSHAKE_TIMEOUT = 8.0    # seconds to wait for that handshake to finish
+
+
+def _hs_debug(msg: str) -> None:
+    """Debug: print and append a handshake trace line to the debug log."""
+    print(msg, flush=True)
+    dlog(msg)
 
 class NoiseSession:
     """Manages a Noise_XX handshake and transport encryption with one peer."""
@@ -103,6 +116,7 @@ class NoiseSession:
         self._send_counter = 0
         self._recv_window = set()  # simplified: track seen counters
         self._last_error = None
+        self.created_at = time.monotonic()
 
     @property
     def is_finished(self) -> bool:
@@ -189,6 +203,7 @@ class BLEService:
         self.cli_redraw = cli_redraw_callback
         self.clients: Dict[str, BleakClient] = {}      # BLE address -> client
         self._connecting: Set[str] = set()
+        self._write_locks: Dict[str, asyncio.Lock] = {}  # BLE address -> write lock
         self._ignored: Set[str] = set()                # confirmed non-peers / dead
         self._attempts: Dict[str, int] = {}
         self._cooldown_until: Dict[str, float] = {}
@@ -261,6 +276,7 @@ class BLEService:
         with self._dedup_lock:
             self._sync_manager._seen_packet_ids = set(self._seen_packets.keys())
         await self._sync_manager.start()
+        self._hs_retry_task = asyncio.ensure_future(self._handshake_retry_loop())
 
         try:
             while self._running:
@@ -273,8 +289,47 @@ class BLEService:
         except asyncio.CancelledError:
             raise
 
+    async def _handshake_retry_loop(self):
+        """Retry Noise handshakes that never finished (lost msg1/msg2 on a dropped link).
+
+        Every HS_RETRY_INTERVAL seconds, for each known peer whose session is missing
+        or unfinished for longer than HS_RETRY_INTERVAL, start a new handshake.
+        Gives up on a peer after HS_RETRY_MAX attempts (reset once it finishes).
+        """
+        attempts: Dict[str, int] = {}
+        try:
+            while self._running:
+                await asyncio.sleep(HS_RETRY_INTERVAL)
+                linked = bool(self.clients) or bool(
+                    self._peripheral is not None and self._peripheral.connected_addresses)
+                if not linked:
+                    continue
+                my_id = self.state.my_peer_id.hex()
+                for pid in list(self.state.peer_info.keys()):
+                    if pid == my_id:
+                        continue
+                    sess = self._noise_sessions.get(pid)
+                    if sess is not None and sess.is_finished:
+                        attempts.pop(pid, None)
+                        continue
+                    if sess is not None and (time.monotonic() - sess.created_at) < HS_RETRY_INTERVAL:
+                        continue  # handshake still in progress
+                    if attempts.get(pid, 0) >= HS_RETRY_MAX:
+                        continue
+                    pub = self.state.get_peer_noise_key(pid)
+                    if pub is None:
+                        continue
+                    attempts[pid] = attempts.get(pid, 0) + 1
+                    dlog(f"HS_RETRY: peer={pid[:8]} attempt={attempts[pid]}")
+                    self._initiate_noise_handshake(pid, pub)
+        except asyncio.CancelledError:
+            raise
+
     async def stop(self):
         self._running = False
+        _t = getattr(self, "_hs_retry_task", None)
+        if _t is not None:
+            _t.cancel()
         try:
             if self.clients:
                 await self.send_leave()
@@ -475,13 +530,29 @@ class BLEService:
         # Handle Noise handshake packets
         if packet.type == MessageType.NOISE_HANDSHAKE:
             peer_id = packet.sender_id.hex()
+            _s = self._noise_sessions.get(peer_id)
+            _hs_debug(f"HS_RECV: from={peer_id[:8]} to={packet.recipient_id.hex()[:8] if packet.recipient_id else None} len={len(packet.payload)} ttl={packet.ttl} session={'none' if _s is None else ('finished' if _s.is_finished else ('initiator' if _s.is_initiator else 'responder'))}")
             # Check if this is for us
             if packet.recipient_id is not None and packet.recipient_id != self.state.my_peer_id:
+                _hs_debug("HS_DROP: not for us")
                 return  # not for us
             # Get peer's noise public key
             peer_noise_pub = self.state.get_peer_noise_key(peer_id)
             if peer_noise_pub is None:
+                _hs_debug("HS_DROP: unknown peer noise key")
                 return  # unknown peer, drop
+            # Drop duplicate handshake frames (same peer + first 16 payload bytes),
+            # matching Android SecurityManager's processedKeyExchanges check.
+            from collections import OrderedDict
+            if not hasattr(self, "_seen_handshakes"):
+                self._seen_handshakes = OrderedDict()
+            hs_key = (peer_id, bytes(packet.payload[:16]))
+            if hs_key in self._seen_handshakes:
+                _hs_debug("HS_DROP: duplicate")
+                return
+            self._seen_handshakes[hs_key] = None
+            while len(self._seen_handshakes) > 500:
+                self._seen_handshakes.popitem(last=False)
             session = self._noise_sessions.get(peer_id)
             if session is None:
                 # Create as responder
@@ -502,6 +573,9 @@ class BLEService:
             if getattr(session, '_last_error', None):
                 self._sys(f"Noise handshake error with {peer_id[:8]}: {session._last_error}")
                 session._last_error = None
+                self._noise_sessions.pop(peer_id, None)
+                return
+            _hs_debug(f"HS_RESULT: peer={peer_id[:8]} response_len={len(response) if response else 0} finished={session.is_finished}")
             if response:
                 # Send response
                 resp_packet = self._sign(BitchatPacket(
@@ -561,6 +635,7 @@ class BLEService:
 
             except Exception as e:
                 print(f"DM_RECV_ERROR: {e}", flush=True)
+                dlog(f"DM_RECV_ERROR: {e}")
             return
         # Handle gossip sync requests (Phase 4)
         if packet.type == MessageType.REQUEST_SYNC:
@@ -997,9 +1072,31 @@ class BLEService:
     async def send_private_message(self, peer_id_hex: str, content: str):
         """Send an encrypted private message to a peer."""
         session = self._noise_sessions.get(peer_id_hex)
-        if session is None or not session.is_finished:
-            self._warn(f"No Noise session with {peer_id_hex[:8]} — handshake not complete.")
-            return
+        # Phones drop their Noise session when their BLE link to us drops and we
+        # are not told.  Re-handshake first if the session is missing, unfinished,
+        # or older than DM_SESSION_MAX_AGE seconds.
+        if (session is None or not session.is_finished
+                or (time.monotonic() - session.created_at) > DM_SESSION_MAX_AGE):
+            peer_noise_pub = self.state.get_peer_noise_key(peer_id_hex)
+            if peer_noise_pub is None:
+                self._warn(f"DM not sent: no Noise key known for {peer_id_hex[:8]}.")
+                return
+            self._initiate_noise_handshake(peer_id_hex, peer_noise_pub)
+            deadline = time.monotonic() + DM_HANDSHAKE_TIMEOUT
+            while time.monotonic() < deadline:
+                session = self._noise_sessions.get(peer_id_hex)
+                if session is not None and session.is_finished:
+                    break
+                await asyncio.sleep(0.1)
+            session = self._noise_sessions.get(peer_id_hex)
+            if session is None or not session.is_finished:
+                self._warn(f"DM not sent: handshake with {peer_id_hex[:8]} failed.")
+                return
+            # The phone may have dropped the peer (and its nickname) when its link
+            # to us went down.  Re-announce now so the phone has our nickname before
+            # the DM arrives (otherwise the sender shows as 'Unknown').
+            await self.send_announce()
+            await asyncio.sleep(0.2)
         try:
             import uuid
             msg_id = str(uuid.uuid4()).upper()
@@ -1018,9 +1115,10 @@ class BLEService:
                 sender_id=self.state.my_peer_id,
                 recipient_id=bytes.fromhex(peer_id_hex),
                 payload=ciphertext,
-                ttl=0,  # DMs are direct, not relayed
+                ttl=DEFAULT_TTL,  # match Android: encrypted DMs use TTL 7 so other peers relay them
             ))
-            print(f"DM_SEND: sender={self.state.my_peer_id.hex()} recipient={peer_id_hex} ttl=0", flush=True)
+            print(f"DM_SEND: sender={self.state.my_peer_id.hex()} recipient={peer_id_hex} ttl={DEFAULT_TTL}", flush=True)
+            dlog(f"DM_SEND: sender={self.state.my_peer_id.hex()} recipient={peer_id_hex} ttl={DEFAULT_TTL}")
             await self._broadcast(packet)
             self._chat(f"[DM to {peer_id_hex[:8]}]", content, is_self=True)
         except Exception as e:
@@ -1035,39 +1133,8 @@ class BLEService:
         await self._broadcast(packet)
 
     async def send_file(self, path: str):
-        """Read a file from disk and broadcast it as a FILE_TRANSFER packet."""
-        p = Path(path).expanduser()
-        try:
-            content = p.read_bytes()
-        except OSError as e:  # noqa: BLE001
-            self._warn(f"Could not read '{path}': {e}")
-            return
-        if len(content) > MAX_PAYLOAD_BYTES:
-            self._warn(
-                f"'{p.name}' is {len(content)} bytes; the limit is "
-                f"{MAX_PAYLOAD_BYTES} bytes (1 MiB). Not sent."
-            )
-            return
-        # Phone FragmentManager rejects > 256 fragments
-        import math
-        chunk_size = MAX_FRAME_SIZE - 40
-        est_fragments = math.ceil(len(content) / chunk_size) + 1
-        if est_fragments > 256:
-            self._warn(
-                f"'{p.name}' would require ~{est_fragments} fragments; "
-                f"the phone limit is 256 (~{256 * chunk_size} bytes). "
-                f"Split the file or send a smaller one."
-            )
-            return
-        if not content:
-            self._warn(f"'{p.name}' is empty. Not sent.")
-            return
-
-        mime = mime_for_extension(p.suffix)
-        category = category_for_mime(mime)
-        fp = BitchatFilePacket(
-            content=content, file_name=p.name, file_size=len(content), mime_type=mime,
-        )
+        self._sys("File transfer is currently disabled.")
+        return
         payload = fp.encode()
         if payload is None:
             self._warn(f"'{p.name}' could not be encoded for transfer. Not sent.")
@@ -1094,6 +1161,25 @@ class BLEService:
         self._media(self.state.nickname, category, f"{p.name} ({len(content)} bytes)",
                     is_self=True)
 
+    async def _write_frame(self, addr: str, client, frame: bytes):
+        """Write one frame to a link: serialized per link, retrying BlueZ 'In Progress'.
+
+        'In Progress' means a previous operation on the link is still pending, so it is
+        transient.  Any other error (or retries exhausted) is raised to the caller.
+        """
+        lock = self._write_locks.setdefault(addr, asyncio.Lock())
+        async with lock:
+            for attempt in range(WRITE_RETRIES + 1):
+                try:
+                    await client.write_gatt_char(CHARACTERISTIC_UUID, frame, response=False)
+                    return
+                except Exception as e:  # noqa: BLE001
+                    if "In Progress" in str(e) and attempt < WRITE_RETRIES:
+                        dlog(f"WRITE_RETRY: addr={addr} attempt={attempt + 1}")
+                        await asyncio.sleep(WRITE_RETRY_DELAY)
+                        continue
+                    raise
+
     async def _broadcast(self, packet: BitchatPacket):
         encoded = packet.encode()
         fragmented = len(encoded) > MAX_FRAME_SIZE
@@ -1105,7 +1191,7 @@ class BLEService:
                 continue
             for frame in frames:
                 try:
-                    await client.write_gatt_char(CHARACTERISTIC_UUID, frame, response=False)
+                    await self._write_frame(addr, client, frame)
                 except Exception as e:  # noqa: BLE001
                     # A write error (e.g. BlueZ stale characteristic) means the
                     # link is dead even if is_connected still reports True. Drop
@@ -1149,6 +1235,7 @@ class BLEService:
     async def _drop_client(self, addr: str, reason: str = ""):
         """Tear down a dead link and let the scanner reconnect later."""
         client = self.clients.pop(addr, None)
+        self._write_locks.pop(addr, None)
         if client is None:
             return
         self.state.remove_connection(addr)
@@ -1193,21 +1280,27 @@ class BLEService:
         self.cli_redraw()
 
     def _sys(self, msg: str):
+        dlog(f"SYS {msg}")
         self._emit(theme.system(msg))
 
     def _ok(self, msg: str):
+        dlog(f"OK {msg}")
         self._emit(theme.ok(msg))
 
     def _warn(self, msg: str):
+        dlog(f"WARN {msg}")
         self._emit(theme.warn(msg))
 
     def _err(self, msg: str):
+        dlog(f"ERR {msg}")
         self._emit(theme.error(msg))
 
     def _join(self, msg: str):
+        dlog(f"JOIN {msg}")
         self._emit(theme.join(msg))
 
     def _leave(self, msg: str):
+        dlog(f"LEAVE {msg}")
         self._emit(theme.leave(msg))
 
     def _chat(self, sender: str, content: str, ts_ms=None, is_self: bool = False):

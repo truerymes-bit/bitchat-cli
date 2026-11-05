@@ -13,6 +13,7 @@ from bluez_peripheral.util import get_message_bus, Adapter
 from bluez_peripheral.agent import NoIoAgent
 
 from .protocol import BitchatPacket
+from .debuglog import dlog
 
 from bluez_peripheral.advert import Advertisement, PacketType, AdvertisingIncludes
 from dbus_next.constants import PropertyAccess
@@ -81,6 +82,7 @@ class BitchatPeripheral:
                         outer.dispatch_fn(packet, addr)
                 except Exception as e:
                     print(f"PERIPHERAL_WRITE_ERROR: {e}", flush=True)
+                    dlog(f"PERIPHERAL_WRITE_ERROR: {e}")
 
         self._service = BitchatService()
         await self._service.register(self._bus)
