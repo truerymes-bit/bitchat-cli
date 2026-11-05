@@ -58,7 +58,6 @@ class BluezScanner:
         self._devices: Dict[str, BluezDevice] = {}
         self._om_iface = None
         self._seen: set = set()
-        self._reenum_task = None
 
     async def start(self):
         self._bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
@@ -99,20 +98,6 @@ class BluezScanner:
 
         await self._adapter_iface.call_start_discovery()
         self._running = True
-        # Periodically re-enumerate to catch devices whose UUIDs populated late
-        if self._reenum_task is None or self._reenum_task.done():
-            self._reenum_task = asyncio.get_event_loop().create_task(self._reenumerate_loop())
-
-    async def _reenumerate_loop(self):
-        while self._running:
-            await asyncio.sleep(10.0)
-            if not self._running:
-                break
-            try:
-                await self._enumerate_devices()
-            except Exception:
-                logging.getLogger("bluez_central").debug(
-                    "re-enumerate failed", exc_info=True)
 
     async def _enumerate_devices(self):
         om_introspection = await self._bus.introspect("org.bluez", "/")
@@ -149,13 +134,6 @@ class BluezScanner:
 
     async def stop(self):
         self._running = False
-        t, self._reenum_task = self._reenum_task, None
-        if t is not None:
-            t.cancel()
-            try:
-                await t
-            except asyncio.CancelledError:
-                pass
         if self._adapter_iface:
             try:
                 await self._adapter_iface.call_stop_discovery()
