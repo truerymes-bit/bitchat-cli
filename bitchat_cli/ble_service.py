@@ -928,7 +928,10 @@ class BLEService:
         """
         recipient_bytes = bytes.fromhex(recipient_hex)
         route_ids = self.state.compute_route(self.state.my_peer_id.hex(), recipient_hex)
-        route_bytes = [bytes.fromhex(h) for h in route_ids] if route_ids else None
+        if route_ids is None:
+            route_bytes = None
+        else:
+            route_bytes = [bytes.fromhex(h) for h in route_ids]
         packet = self._sign(BitchatPacket(
             type=MessageType.MESSAGE,
             sender_id=self.state.my_peer_id,
@@ -941,11 +944,13 @@ class BLEService:
         await self._broadcast(packet)
         if self._sync_manager is not None:
             self._sync_manager.record_packet(packet)
-        if route_bytes:
+        if route_ids is None:
+            self._sys("No route found - broadcasting (flood).")
+        elif route_ids:
             hops = " -> ".join([self.state.my_peer_id.hex()[:8]] + [h[:8] for h in route_ids] + [recipient_hex[:8]])
             self._sys(f"Routed via: {hops}")
         else:
-            self._sys("No route found - broadcasting (flood).")
+            self._sys("Direct peer - broadcasting.")
         message = BitchatMessage(content=content, sender=self.state.nickname)
         self.state.add_message(message)
         self._chat(self.state.nickname, content, is_self=True)

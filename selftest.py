@@ -270,6 +270,27 @@ def test_public_message_payload_is_raw():
           decoded.payload.decode("utf-8") == content)
 
 
+def test_compute_route_shape():
+    # compute_route returns intermediate hops only: [] for direct, [..] for
+    # multi-hop, None when unreachable or self-to-self.
+    from bitchat_cli.chat_state import ChatState
+    SELF = "aaaaaaaaaaaaaaaa"
+    A = "bbbbbbbbbbbbbbbb"
+    B = "cccccccccccccccc"
+    state = ChatState(nickname="self", my_peer_id=bytes.fromhex(SELF))
+    state.add_direct_peer(A)
+    state.update_topology(A, [bytes.fromhex(B)], timestamp=1)
+    state.update_topology(B, [bytes.fromhex(A)], timestamp=1)
+    check("direct neighbor -> []",
+          state.compute_route(SELF, A) == [])
+    check("two-hop chain -> [A]",
+          state.compute_route(SELF, B) == [A])
+    check("unreachable -> None",
+          state.compute_route(SELF, "dddddddddddddddd") is None)
+    check("self-to-self -> None",
+          state.compute_route(SELF, SELF) is None)
+
+
 if __name__ == "__main__":
     print("Running bitchat-cli protocol self-tests...\n")
     for test in (
@@ -285,6 +306,7 @@ if __name__ == "__main__":
         test_file_fragment_reassembly,
         test_mime_helpers,
         test_public_message_payload_is_raw,
+        test_compute_route_shape,
     ):
         print(f"{test.__name__}:")
         test()

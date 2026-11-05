@@ -35,7 +35,7 @@ python selftest.py                # offline protocol round-trip + signature test
 
 `selftest.py` is the only thing runnable without hardware; it imports the `bitchat_cli` package, so run it from the repo root. The app requires a working Bluetooth LE adapter — without one it starts, prints the logo, and reports that the scan could not start. `selftest.py` needs only `cryptography` (not `prompt-toolkit`), so it runs in CI/headless. Published to PyPI as `bitchat-cli`; version is single-sourced in `bitchat_cli/__init__.py`.
 
-In-app slash commands: `/w` (list known peers by peer-ID → nickname), `/peers` (list peers with keys and verification status), `/dm <id> <msg>` (encrypted private message), `/verify <id>` (mark peer as verified), `/unverify <id>` (remove verification), `/name <nick>` (change nickname + re-announce), `/send <path>` (broadcast an image/voice note/file; alias `/file`), `/clear`, `/help`. Any non-slash input is broadcast publicly to connected peers.
+In-app slash commands: `/w` (list known peers by peer-ID → nickname), `/peers` (list peers with keys and verification status), `/dm <id> <msg>` (encrypted private message), `/verify <id>` (mark peer as verified), `/unverify <id>` (remove verification), `/name <nick>` (change nickname + re-announce), `/send <path>` (broadcast an image/voice note/file; alias `/file`), `/clear`, `/topology`, `/route <id> <msg>`, `/sync`, `/help`. Any non-slash input is broadcast publicly to connected peers.
 
 ## Architecture
 
