@@ -526,35 +526,39 @@ class BLEService:
                 return  # no session or handshake not complete
             try:
                 plaintext = session.decrypt(packet.payload)
-                # Parse wire format as bytes: \x01\x00$<UUID>\x01<len><content>
-                # Type byte: \x01 = DM, \x02 = delivery receipt, \x03 = read receipt
-                # Don't decode entire plaintext as UTF-8 (length byte may be >= 0x80)
-                if len(plaintext) < 10:
+                # Parse NoisePayload: type byte + data
+                if len(plaintext) < 2:
                     return
-                msg_type_byte = plaintext[0]
-                msg_type = chr(msg_type_byte) if msg_type_byte < 128 else ''
-                # Use bytes regex to find UUID + length marker (robust to format variations)
-                import re as _re
-                m = _re.search(
-                    rb'\$[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\x01(.)',
-                    plaintext, _re.DOTALL)
-                if not m:
+                noise_type = plaintext[0]
+                if noise_type != 0x01:  # PRIVATE_MESSAGE only
                     return
-                content_len = m.group(1)[0]
-                content_start = m.end()
-                content_bytes = plaintext[content_start:content_start + content_len]
-                try:
-                    content = content_bytes.decode('utf-8')
-                except UnicodeDecodeError:
-                    content = None
+                # Parse PrivateMessagePacket TLV from plaintext[1:]
+                data = plaintext[1:]
+                msg_id = None
+                content = None
+                offset = 0
+                while offset + 2 <= len(data):
+                    tlv_type = data[offset]
+                    tlv_len = data[offset + 1]
+                    offset += 2
+                    if offset + tlv_len > len(data):
+                        break
+                    val = data[offset:offset + tlv_len]
+                    offset += tlv_len
+                    if tlv_type == 0x00:
+                        msg_id = val.decode('utf-8', errors='replace')
+                    elif tlv_type == 0x01:
+                        content = val.decode('utf-8', errors='replace')
+                if content is None:
+                    return
                 sender = self.state.nickname_for(peer_id)
-                # Only display type 1 (DM) messages, skip receipts (type 2, 3)
-                if msg_type == '\x01' and content is not None:
-                    display = content.strip() if content.strip() else "(empty)"
-                    self.state.add_message(
-                        BitchatMessage(content=display, sender=sender, timestamp=packet.timestamp)
-                    )
-                    self._chat(f"[DM] {sender}", display, ts_ms=packet.timestamp)
+                display = content.strip() if content.strip() else "(empty)"
+                self.state.add_message(
+                    BitchatMessage(content=display, sender=sender, timestamp=packet.timestamp)
+                )
+                self._chat(f"[DM] {sender}", display, ts_ms=packet.timestamp)
+                return
+
             except Exception as e:
                 print(f"DM_RECV_ERROR: {e}", flush=True)
             return
@@ -1003,9 +1007,11 @@ class BLEService:
             if len(content_bytes) > 255:
                 self._warn(f"DM content too long ({len(content_bytes)} bytes > 255) — not sent.")
                 return
-            # Build plaintext as bytes to avoid UTF-8 multi-byte encoding of length
-            wire_prefix = f"\x01\x00${msg_id}\x01".encode('utf-8')
-            plaintext = wire_prefix + bytes([len(content_bytes)]) + content_bytes
+            # Build NoisePayload: type byte 0x01 (PRIVATE_MESSAGE) + PrivateMessagePacket TLV
+            # TLV: [0x00][len][msg_id][0x01][len][content]
+            msg_id_bytes = msg_id.encode('utf-8')
+            tlv = bytes([0x00, len(msg_id_bytes)]) + msg_id_bytes + bytes([0x01, len(content_bytes)]) + content_bytes
+            plaintext = bytes([0x01]) + tlv
             ciphertext = session.encrypt(plaintext)
             packet = self._sign(BitchatPacket(
                 type=MessageType.NOISE_ENCRYPTED,
