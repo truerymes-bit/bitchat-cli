@@ -98,6 +98,18 @@ class BluezScanner:
 
         await self._adapter_iface.call_start_discovery()
         self._running = True
+        # Periodically re-enumerate to catch devices whose UUIDs populated late
+        self._reenum_task = asyncio.ensure_future(self._reenumerate_loop())
+
+    async def _reenumerate_loop(self):
+        while self._running:
+            await asyncio.sleep(10.0)
+            if not self._running:
+                break
+            try:
+                await self._enumerate_devices()
+            except Exception:
+                pass
 
     async def _enumerate_devices(self):
         om_introspection = await self._bus.introspect("org.bluez", "/")
@@ -134,6 +146,8 @@ class BluezScanner:
 
     async def stop(self):
         self._running = False
+        if hasattr(self, '_reenum_task') and self._reenum_task:
+            self._reenum_task.cancel()
         if self._adapter_iface:
             try:
                 await self._adapter_iface.call_stop_discovery()
