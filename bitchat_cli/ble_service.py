@@ -1048,6 +1048,17 @@ class BLEService:
                 f"{MAX_PAYLOAD_BYTES} bytes (1 MiB). Not sent."
             )
             return
+        # Phone FragmentManager rejects > 256 fragments
+        import math
+        chunk_size = MAX_FRAME_SIZE - 40
+        est_fragments = math.ceil(len(content) / chunk_size) + 1
+        if est_fragments > 256:
+            self._warn(
+                f"'{p.name}' would require ~{est_fragments} fragments; "
+                f"the phone limit is 256 (~{256 * chunk_size} bytes). "
+                f"Split the file or send a smaller one."
+            )
+            return
         if not content:
             self._warn(f"'{p.name}' is empty. Not sent.")
             return
