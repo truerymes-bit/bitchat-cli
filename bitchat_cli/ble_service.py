@@ -1020,6 +1020,7 @@ class BLEService:
                 payload=ciphertext,
                 ttl=0,  # DMs are direct, not relayed
             ))
+            print(f"DM_SEND: sender={self.state.my_peer_id.hex()} recipient={peer_id_hex} ttl=0", flush=True)
             await self._broadcast(packet)
             self._chat(f"[DM to {peer_id_hex[:8]}]", content, is_self=True)
         except Exception as e:
