@@ -48,8 +48,12 @@ Language: Python 3.14, Fedora Linux
 - Linux-only (BlueZ, no bleak)
 - `send_routed_message` floods from the origin instead of unicasting to the first hop (deferred until BLE hardware testing)
 
-## Android reference
-~/bitchat-android — protocol docs in docs/ (SOURCE_ROUTING.md, sync.md, ANNOUNCEMENT_GOSSIP.md)
+## Android reference (PRIMARY SOURCE OF TRUTH)
+~/bitchat-android — the official bitchat Android client, used by millions.
+This is PROVEN, production software. The CLI fork should align with it whenever
+possible. Protocol docs: docs/SOURCE_ROUTING.md, docs/sync.md, docs/ANNOUNCEMENT_GOSSIP.md,
+docs/NOISE_PEER_ID_BINDING.md, docs/PRIVATE_MEDIA_V1.md.
+When in doubt, check what Android does — it is the reference implementation.
 
 ## Commands
 - bitchat / bitchat-quiet — run the client
