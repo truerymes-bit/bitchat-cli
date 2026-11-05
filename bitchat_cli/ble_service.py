@@ -555,8 +555,8 @@ class BLEService:
                         BitchatMessage(content=display, sender=sender, timestamp=packet.timestamp)
                     )
                     self._chat(f"[DM] {sender}", display, ts_ms=packet.timestamp)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"DM_RECV_ERROR: {e}", flush=True)
             return
         # Handle gossip sync requests (Phase 4)
         if packet.type == MessageType.REQUEST_SYNC:
