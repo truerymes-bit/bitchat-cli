@@ -178,6 +178,10 @@ _MIME_INFO = {
     "audio/x-wav": ("audio", "wav"),
     "audio/ogg": ("audio", "ogg"),
     "application/pdf": ("file", "pdf"),
+    "text/plain": ("file", "txt"),
+    "text/markdown": ("file", "md"),
+    "text/csv": ("file", "csv"),
+    "application/json": ("file", "json"),
     OCTET_STREAM: ("file", "bin"),
 }
 
@@ -195,6 +199,10 @@ _EXT_TO_MIME = {
     "wav": "audio/wav",
     "ogg": "audio/ogg",
     "pdf": "application/pdf",
+    "txt": "text/plain",
+    "md": "text/markdown",
+    "csv": "text/csv",
+    "json": "application/json",
 }
 
 
