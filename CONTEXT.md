@@ -63,8 +63,10 @@ When in doubt, check what Android does — it is the reference implementation.
 - #12: send announce before each DM (0.2s delay) so phones that dropped the peer show "cli_client" instead of "Unknown"
 - #6: debuglog.py — verbose logging to ~/.bitchat/bitchat-debug.log (2MB cap, trims to newest ~1MB); HS, DM send/receive, peripheral write errors routed there
 - File transfer disabled in send_file (prints "File transfer is currently disabled.") pending fragmentation/signature issue
+- Read receipts (0x02): supported in protocol but disabled in CLI — no mailbox UI to mark messages as read; enable when mailbox system is built
+- NOSTR transport: not implemented; BLE-only CLI
 - Tested: all 3 phones (gs9, Fold7, S24) receive DMs reliably; sender name correct on S24
-- Known: #10 (DM delivery acknowledgement retry) proposed but not applied; S24 wireless adb drops when screen turns off
+- Known: #10 applied (DM delivery ack retry). S24 wireless adb drops when screen turns off. File transfer disabled. Nostr not implemented.
 
 ## Commands
 - bitchat / bitchat-quiet — run the client
