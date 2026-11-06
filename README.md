@@ -13,7 +13,7 @@ exchange text, images, voice notes, and files one hop with a real bitchat phone 
 [![Publish](https://img.shields.io/github/actions/workflow/status/dearabhin/bitchat-cli/publish.yml?style=flat-square&logo=githubactions&logoColor=white&label=publish)](https://github.com/dearabhin/bitchat-cli/actions/workflows/publish.yml)
 [![Latest release](https://img.shields.io/github/v/release/dearabhin/bitchat-cli?style=flat-square&logo=github&color=orange)](https://github.com/dearabhin/bitchat-cli/releases)
 [![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue?style=flat-square)](LICENSE)
-![Platforms](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey?style=flat-square)
+![Platforms](https://img.shields.io/badge/platform-Linux%20only-lightgrey?style=flat-square)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen?style=flat-square)](#-contributing)
 
 <img src="https://raw.githubusercontent.com/dearabhin/bitchat-cli/main/bitchat.png" alt="bitchat-cli terminal UI" width="660">
@@ -26,14 +26,14 @@ exchange text, images, voice notes, and files one hop with a real bitchat phone 
 
 - 🛰️ **Serverless & decentralized** — no internet, accounts, or servers. Just Bluetooth.
 - 📡 **Talks to the real app** — interoperates with [bitchat](https://github.com/permissionlesstech/bitchat) on iOS/Android for public/broadcast chat.
-- 🖼️ **Media support** — send and receive **images, voice notes, and files** (`/send <path>`); received media is saved to `~/.bitchat/downloads/` and opened automatically.
+- 🖼️ **Media support** 🆕 — send and receive **images, voice notes, and files** (`/send <path>`); received media is saved to `~/.bitchat/downloads/` and opened automatically. File payloads are compressed to match Android's wire format.
 - 🔐 **Signed messages** — every packet is Ed25519-signed, matching the format the app requires.
-- 🔒 **Noise-encrypted DMs** — private messages over Noise_XX_25519_ChaChaPoly_SHA256, wire-compatible with bitchat phones.
+- 🔒 **Noise-encrypted DMs** 🆕 — private messages over Noise_XX_25519_ChaChaPoly_SHA256, wire-compatible with bitchat phones. Includes background handshake retry, delivery-ack retry, and per-link write locking.
 - 🔄 **Gossip sync** — GCS filter sync for catch-up on missed messages and announcements (Phase 4).
-- ✅ **Out-of-band verification** — compare fingerprints and mark peers as verified with `/verify`.
+- ✅ **Out-of-band verification** 🆕 — compare fingerprints and mark peers as verified with `/verify`.
 - 📡 **BlueZ transport** — uses BlueZ D-Bus for both GATT client and server roles.
 - 🎨 **TUI** — timestamps, a stable color per peer, and clear status glyphs. Honors `NO_COLOR`.
-- 🐍 **Pure Python** — runs on Linux, macOS, and Windows.
+- 🐍 **Pure Python** — runs on **Linux only** (BlueZ D-Bus required).
 
 ## 📦 Installation
 
