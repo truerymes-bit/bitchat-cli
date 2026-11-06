@@ -90,6 +90,8 @@ HS_RETRY_INTERVAL = 10.0      # seconds between background handshake retries
 HS_RETRY_MAX = 6              # max background retries per peer
 WRITE_RETRIES = 3             # retries for a BLE write that fails with 'In Progress'
 WRITE_RETRY_DELAY = 0.05      # seconds between those retries
+DM_ACK_TIMEOUT = 10.0         # seconds before retrying an unacked DM
+DM_ACK_MAX_RETRIES = 3        # max retries per DM
 DM_HANDSHAKE_TIMEOUT = 8.0    # seconds to wait for that handshake to finish
 
 
@@ -206,6 +208,7 @@ class BLEService:
         self._write_locks: Dict[str, asyncio.Lock] = {}  # BLE address -> write lock
         self._ignored: Set[str] = set()                # confirmed non-peers / dead
         self._ignored_peers: Set[str] = set()          # peer IDs confirmed non-peers / dead (from scan response)
+        self._pending_acks: Dict[str, dict] = {}      # msg_id -> {peer_id, content, time, retries}
         self._attempts: Dict[str, int] = {}
         self._cooldown_until: Dict[str, float] = {}
         self._reassembler = FragmentReassembler()
@@ -278,6 +281,7 @@ class BLEService:
             self._sync_manager._seen_packet_ids = set(self._seen_packets.keys())
         await self._sync_manager.start()
         self._hs_retry_task = asyncio.ensure_future(self._handshake_retry_loop())
+        self._dm_ack_task = asyncio.ensure_future(self._dm_ack_retry_loop())
 
         try:
             while self._running:
@@ -326,11 +330,43 @@ class BLEService:
         except asyncio.CancelledError:
             raise
 
+    async def _dm_ack_retry_loop(self):
+        """Retry DMs that have not received a delivery ack."""
+        try:
+            while self._running:
+                await asyncio.sleep(5.0)
+                now = time.monotonic()
+                to_retry = []
+                for msg_id in list(self._pending_acks.keys()):
+                    info = self._pending_acks.get(msg_id)
+                    if info is None:
+                        continue
+                    if now - info["time"] < DM_ACK_TIMEOUT:
+                        continue
+                    if info["retries"] >= DM_ACK_MAX_RETRIES:
+                        self._warn(f"DM delivery failed (no ack): {msg_id[:8]}")
+                        del self._pending_acks[msg_id]
+                        continue
+                    to_retry.append((msg_id, info))
+                for msg_id, info in to_retry:
+                    info["retries"] += 1
+                    info["time"] = now
+                    dlog(f"DM_RETRY: msg_id={msg_id[:8]} attempt={info['retries']}")
+                    try:
+                        await self.send_private_message(info["peer_id"], info["content"])
+                    except Exception as e:
+                        dlog(f"DM_RETRY failed: {e}")
+        except asyncio.CancelledError:
+            raise
+
     async def stop(self):
         self._running = False
         _t = getattr(self, "_hs_retry_task", None)
         if _t is not None:
             _t.cancel()
+        _t2 = getattr(self, "_dm_ack_task", None)
+        if _t2 is not None:
+            _t2.cancel()
         try:
             if self.clients:
                 await self.send_leave()
@@ -628,6 +664,12 @@ class BLEService:
                 if len(plaintext) < 2:
                     return
                 noise_type = plaintext[0]
+                if noise_type == 0x03:  # DELIVERED ack
+                    ack_msg_id = plaintext[1:].decode('utf-8', errors='replace')
+                    dlog(f"DM_ACK_RECV: from={peer_id[:8]} msg_id={ack_msg_id}")
+                    self._pending_acks.pop(ack_msg_id, None)
+                    self._ok(f"DM delivered: {ack_msg_id[:8]}")
+                    return
                 if noise_type != 0x01:  # PRIVATE_MESSAGE only
                     return
                 # Parse PrivateMessagePacket TLV from plaintext[1:]
@@ -655,6 +697,9 @@ class BLEService:
                     BitchatMessage(content=display, sender=sender, timestamp=packet.timestamp)
                 )
                 self._chat(f"[DM] {sender}", display, ts_ms=packet.timestamp)
+                # Send delivery ACK back, mirroring Android's sendDeliveryAck.
+                if msg_id is not None:
+                    asyncio.ensure_future(self._send_delivery_ack(peer_id, msg_id))
                 return
 
             except Exception as e:
@@ -1093,6 +1138,26 @@ class BLEService:
         self._chat(self.state.nickname, content, is_self=True)
         return message
 
+    async def _send_delivery_ack(self, recipient_peer_id: str, message_id: str):
+        """Send a DELIVERED ack, mirroring Android's sendDeliveryAck."""
+        session = self._noise_sessions.get(recipient_peer_id)
+        if session is None or not session.is_finished:
+            return
+        try:
+            ack_payload = bytes([0x03]) + message_id.encode('utf-8')
+            ciphertext = session.encrypt(ack_payload)
+            packet = self._sign(BitchatPacket(
+                type=MessageType.NOISE_ENCRYPTED,
+                sender_id=self.state.my_peer_id,
+                recipient_id=bytes.fromhex(recipient_peer_id),
+                payload=ciphertext,
+                ttl=DEFAULT_TTL,
+            ))
+            await self._broadcast(packet)
+            dlog(f"DM_ACK_SEND: to={recipient_peer_id[:8]} msg_id={message_id}")
+        except Exception as e:
+            dlog(f"DM_ACK_SEND failed: {e}")
+
     async def send_private_message(self, peer_id_hex: str, content: str):
         """Send an encrypted private message to a peer."""
         session = self._noise_sessions.get(peer_id_hex)
@@ -1144,6 +1209,7 @@ class BLEService:
             print(f"DM_SEND: sender={self.state.my_peer_id.hex()} recipient={peer_id_hex} ttl={DEFAULT_TTL}", flush=True)
             dlog(f"DM_SEND: sender={self.state.my_peer_id.hex()} recipient={peer_id_hex} ttl={DEFAULT_TTL}")
             await self._broadcast(packet)
+            self._pending_acks[msg_id] = {"peer_id": peer_id_hex, "content": content, "time": time.monotonic(), "retries": 0}
             self._chat(f"[DM to {peer_id_hex[:8]}]", content, is_self=True)
         except Exception as e:
             self._warn(f"Failed to send private message: {e}")
