@@ -89,6 +89,23 @@ class MessagePadding:
         return data[:-pad_len]
 
 
+COMPRESSION_THRESHOLD = 100  # matches Android AppConstants.COMPRESSION_THRESHOLD_BYTES
+
+
+def _should_compress(data: bytes) -> bool:
+    """Same heuristic as Android CompressionUtil.shouldCompress."""
+    if len(data) < COMPRESSION_THRESHOLD:
+        return False
+    return len(set(data)) / min(len(data), 256) < 0.9
+
+
+def _deflate_raw(data: bytes) -> Optional[bytes]:
+    """Raw DEFLATE at default level (like Java Deflater(DEFAULT, nowrap=True))."""
+    c = zlib.compressobj(zlib.Z_DEFAULT_COMPRESSION, zlib.DEFLATED, -15)
+    out = c.compress(data) + c.flush()
+    return out if 0 < len(out) < len(data) else None
+
+
 def _decompress(compressed: bytes, original_size: int) -> Optional[bytes]:
     """Decompress an inbound payload. Apple's zlib produces raw DEFLATE."""
     for wbits in (-15, 15):
@@ -133,8 +150,20 @@ class BitchatPacket:
         if self.route and self.version >= 2 and self.recipient_id is not None:
             flags |= PacketFlags.HAS_ROUTE
 
+        # Mirror Android: compress FILE_TRANSFER payloads (>=100 bytes, <90% unique
+        # bytes) with raw DEFLATE, prefixed by the original size. Android verifies
+        # the signature over its own compressed re-encode, so we must send (and
+        # sign) the compressed form too.
+        wire_payload = self.payload
+        if (int(self.type) == MessageType.FILE_TRANSFER and self.version >= 2
+                and _should_compress(self.payload)):
+            comp = _deflate_raw(self.payload)
+            if comp is not None:
+                flags |= PacketFlags.IS_COMPRESSED
+                wire_payload = len(self.payload).to_bytes(4, "big") + comp
+
         sender = self.sender_id[:SENDER_ID_SIZE].ljust(SENDER_ID_SIZE, b"\x00")
-        payload_len = len(self.payload)
+        payload_len = len(wire_payload)
 
         if self.version >= 2:
             data = struct.pack(
@@ -162,7 +191,7 @@ class BitchatPacket:
             data += len(hops).to_bytes(1, "big")
             for h in hops:
                 data += h
-        data += self.payload
+        data += wire_payload
         if self.signature is not None:
             data += self.signature[:SIGNATURE_SIZE]
 
