@@ -1223,11 +1223,46 @@ class BLEService:
         await self._broadcast(packet)
 
     async def send_file(self, path: str):
-        self._sys("File transfer is currently disabled.")
-        return
+        """Send a file (image, voice note, or generic file) to all peers."""
+        p = Path(path).expanduser().resolve()
+        if not p.is_file():
+            self._warn(f"File not found: {path}")
+            return
+
+        try:
+            content = p.read_bytes()
+        except OSError as e:
+            self._warn(f"Could not read file: {e}")
+            return
+
+        if len(content) > MAX_PAYLOAD_BYTES:
+            self._warn(f"File too large ({len(content)} bytes). Max 1 MiB.")
+            return
+
+        ext = p.suffix.lower().lstrip(".")
+        mime = mime_for_extension(ext)
+        category = category_for_mime(mime)
+
+        fp = BitchatFilePacket(
+            content=content,
+            file_name=p.name,
+            file_size=len(content),
+            mime_type=mime,
+        )
+
         payload = fp.encode()
         if payload is None:
             self._warn(f"'{p.name}' could not be encoded for transfer. Not sent.")
+            return
+
+        # Android's FragmentManager rejects trains of more than 256 fragments.
+        # Estimate from the actual encoded packet size (post-compression).
+        import math
+        chunk_size = MAX_FRAME_SIZE - 40
+        est_fragments = math.ceil((len(payload) + 100) / chunk_size)
+        if est_fragments > 256:
+            self._warn(f"'{p.name}' would need ~{est_fragments} fragments; the phone "
+                       f"limit is 256 (~{256 * chunk_size // 1024} KiB). Not sent.")
             return
 
         has_peers = bool(self.clients) or (self._peripheral is not None and bool(self._peripheral.connected_addresses))
@@ -1238,7 +1273,7 @@ class BLEService:
 
         packet = self._sign(BitchatPacket(
             type=MessageType.FILE_TRANSFER, sender_id=self.state.my_peer_id,
-            recipient_id=BROADCAST_RECIPIENT, payload=payload, ttl=DEFAULT_TTL, version=2,
+            recipient_id=None, payload=payload, ttl=DEFAULT_TTL, version=2,
         ))
         kib = len(content) / 1024
         self._sys(f"Sending {p.name} ({kib:.0f} KiB) — large files take a few seconds…")
