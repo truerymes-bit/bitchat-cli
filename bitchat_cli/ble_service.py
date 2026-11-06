@@ -205,6 +205,7 @@ class BLEService:
         self._connecting: Set[str] = set()
         self._write_locks: Dict[str, asyncio.Lock] = {}  # BLE address -> write lock
         self._ignored: Set[str] = set()                # confirmed non-peers / dead
+        self._ignored_peers: Set[str] = set()          # peer IDs confirmed non-peers / dead (from scan response)
         self._attempts: Dict[str, int] = {}
         self._cooldown_until: Dict[str, float] = {}
         self._reassembler = FragmentReassembler()
@@ -377,6 +378,21 @@ class BLEService:
         addr = device.address.upper()
         if addr in self.clients or addr in self._connecting or addr in self._ignored:
             return
+        # Android phones include their peer ID in the scan response (first 8
+        # bytes of service data) so scanners can deduplicate by peer ID even
+        # when the advertising MAC rotates.  Use it to avoid treating a rotated
+        # address as a new device.
+        peer_id_hex = None
+        sd = (getattr(adv, "service_data", None) or {}).get(SERVICE_UUID)
+        if sd and len(sd) >= 8:
+            peer_id_hex = sd[:8].hex()
+        if peer_id_hex is not None:
+            if peer_id_hex in self._ignored_peers:
+                self._ignored.add(addr)
+                return
+            if peer_id_hex in self._noise_sessions:
+                self._ignored.add(addr)
+                return
         if time.monotonic() < self._cooldown_until.get(addr, 0.0):
             return
         # Only connect to devices actually advertising the bitchat service.
@@ -384,9 +400,9 @@ class BLEService:
         if SERVICE_UUID not in advertised:
             return
         self._connecting.add(addr)
-        asyncio.create_task(self._connect(device))
+        asyncio.create_task(self._connect(device, peer_id_hex))
 
-    async def _connect(self, device: BLEDevice):
+    async def _connect(self, device: BLEDevice, peer_id_hex: Optional[str] = None):
         addr = device.address.upper()
         attempts = self._attempts.get(addr, 0) + 1
         self._attempts[addr] = attempts
@@ -397,6 +413,8 @@ class BLEService:
             if not self._has_characteristic(client):
                 self._sys(f"{addr} is not a bitchat peer; ignoring.")
                 self._ignored.add(addr)
+                if peer_id_hex is not None:
+                    self._ignored_peers.add(peer_id_hex)
                 await client.disconnect()
                 return
 
@@ -408,6 +426,8 @@ class BLEService:
         except Exception as e:  # noqa: BLE001 - never let a connect kill the loop
             reason = "timed out" if isinstance(e, asyncio.TimeoutError) else str(e)
             self._fail_device(addr, reason)
+            if peer_id_hex is not None:
+                self._ignored_peers.add(peer_id_hex)
             await self._safe_disconnect(client)
         finally:
             self._connecting.discard(addr)
@@ -416,6 +436,10 @@ class BLEService:
         if self._attempts.get(addr, 0) >= MAX_CONNECT_ATTEMPTS:
             self._warn(f"Giving up on {addr} after {MAX_CONNECT_ATTEMPTS} attempts ({reason}).")
             self._ignored.add(addr)
+            # Prevent unbounded growth over long-running sessions.
+            if len(self._ignored) > 500:
+                self._ignored.clear()
+                self._ignored_peers.clear()
         else:
             self._cooldown_until[addr] = time.monotonic() + RETRY_COOLDOWN
 
