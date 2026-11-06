@@ -1238,7 +1238,7 @@ class BLEService:
 
         packet = self._sign(BitchatPacket(
             type=MessageType.FILE_TRANSFER, sender_id=self.state.my_peer_id,
-            recipient_id=None, payload=payload, ttl=DEFAULT_TTL, version=2,
+            recipient_id=BROADCAST_RECIPIENT, payload=payload, ttl=DEFAULT_TTL, version=2,
         ))
         kib = len(content) / 1024
         self._sys(f"Sending {p.name} ({kib:.0f} KiB) — large files take a few seconds…")
