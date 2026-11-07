@@ -462,7 +462,9 @@ class BLEService:
         except Exception as e:  # noqa: BLE001 - never let a connect kill the loop
             reason = "timed out" if isinstance(e, asyncio.TimeoutError) else str(e)
             self._fail_device(addr, reason)
-            if peer_id_hex is not None:
+            # Only blacklist the peer ID once _fail_device has given up on this
+            # address; otherwise one transient failure blocks every retry.
+            if peer_id_hex is not None and addr in self._ignored:
                 self._ignored_peers.add(peer_id_hex)
             await self._safe_disconnect(client)
         finally:
