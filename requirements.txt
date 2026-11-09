@@ -2,3 +2,5 @@ cryptography>=3.4.8
 prompt-toolkit>=3.0.43
 noiseprotocol>=0.3.1
 textual>=8.2.7
+dbus-next>=0.2.3
+bluez-peripheral>=0.1.7
