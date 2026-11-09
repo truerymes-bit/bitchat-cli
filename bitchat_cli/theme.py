@@ -10,6 +10,8 @@ import os
 import sys
 import time
 
+from . import palette
+
 
 def _color_enabled() -> bool:
     # https://no-color.org/ — any value (even empty) disables colour.
@@ -35,37 +37,29 @@ def sgr(text: str, *codes: str) -> str:
     return "".join(f"\033[{c}m" for c in codes) + text + "\033[0m"
 
 
-# --- Semantic palette (256-colour) --------------------------------------- #
+# --- Semantic palette (derived from palette.py) -------------------------- #
 BOLD = "1"
 DIM = "2"
-BRAND = _fg(42)     # bitchat green — logo, prompt, accents
-OWN = _fg(45)       # your own nickname (teal)
-TIME = _fg(240)     # timestamps (dim grey)
-SYS = _fg(245)      # neutral system info
-OK = _fg(42)        # success / connected
-JOIN = _fg(42)      # peer came online
-LEAVE = _fg(244)    # peer went offline
-ERR = _fg(203)      # errors (soft red)
-WARN = _fg(214)     # warnings (amber)
-MEDIA = _fg(212)    # media labels (pink)
-PATH = _fg(240)     # file paths (dim)
-LABEL = _fg(244)    # banner field labels
+BRAND = palette.sgr_fg(palette.EMERALD)    # bitchat green — logo, prompt, accents
+OWN = palette.sgr_fg(palette.CYAN)         # local user
+REMOTE = palette.sgr_fg(palette.PINK)      # remote users
+TIME = palette.sgr_fg(palette.MUTED)       # timestamps
+SYS = palette.sgr_fg(palette.MUTED)        # neutral system info
+OK = BRAND                                 # success / connected
+JOIN = BRAND                               # peer came online
+LEAVE = palette.sgr_fg(palette.MUTED)      # peer went offline
+ERR = palette.sgr_fg(palette.RED)          # errors
+WARN = palette.sgr_fg(palette.AMBER)       # warnings
+MEDIA = palette.sgr_fg(palette.PINK)       # media labels
+PATH = palette.sgr_fg(palette.MUTED)       # file paths
+LABEL = palette.sgr_fg(palette.MUTED)      # banner field labels
 
-# A spread of legible colours assigned to peer nicknames by hash, so each peer
-# keeps a stable, distinct colour across the session. Excludes the reserved
-# OWN/system hues above to avoid confusion.
-_NICK_PALETTE = [_fg(n) for n in (
-    39, 75, 81, 114, 150, 156, 180, 215, 211, 209, 176, 147, 84, 222, 117, 110,
-)]
+# (true-colour palette only; no 256-colour helpers remain)
 
 _MEDIA_ICON = {"image": "🖼", "audio": "🎙", "file": "📎"}
 
 
-def nick_color(name: str) -> str:
-    if not name:
-        return SYS
-    h = int(hashlib.md5(name.encode("utf-8")).hexdigest(), 16)
-    return _NICK_PALETTE[h % len(_NICK_PALETTE)]
+# (nick_color removed; remote senders use REMOTE)
 
 
 def _hm(ts_ms=None) -> str:
@@ -75,18 +69,18 @@ def _hm(ts_ms=None) -> str:
 
 # --- Line formatters ----------------------------------------------------- #
 def chat(sender: str, content: str, ts_ms=None, is_self: bool = False) -> str:
-    color = OWN if is_self else nick_color(sender)
-    return f"{sgr(_hm(ts_ms), TIME)}  {sgr(sender, BOLD, color)}  {content}"
+    color = OWN if is_self else REMOTE
+    return f"{sgr(_hm(ts_ms).ljust(5), TIME)}  {sgr(sender.ljust(12), BOLD, color)}  {content}"
 
 
 def media(sender: str, category: str, label: str, path=None,
           ts_ms=None, is_self: bool = False) -> str:
-    color = OWN if is_self else nick_color(sender)
+    color = OWN if is_self else REMOTE
     icon = _MEDIA_ICON.get(category, _MEDIA_ICON["file"])
     body = sgr(f"{icon} {label}", MEDIA)
     if path is not None:
         body += " " + sgr(f"→ {path}", PATH)
-    return f"{sgr(_hm(ts_ms), TIME)}  {sgr(sender, BOLD, color)}  {body}"
+    return f"{sgr(_hm(ts_ms).ljust(5), TIME)}  {sgr(sender.ljust(12), BOLD, color)}  {body}"
 
 
 def system(msg: str) -> str:
@@ -98,7 +92,7 @@ def ok(msg: str) -> str:
 
 
 def join(msg: str) -> str:
-    return f"{sgr('→', BOLD, JOIN)} {sgr(msg, JOIN)}"
+    return f"{sgr('>', BOLD, JOIN)} {sgr(msg, JOIN)}"
 
 
 def leave(msg: str) -> str:

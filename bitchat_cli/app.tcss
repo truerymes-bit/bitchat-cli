@@ -1,0 +1,257 @@
+/* All colours come from palette.py via $bc-* variables (BitchatApp.get_css_variables). */
+
+Screen {
+    background: $bc-bg;
+    color: $bc-text;
+}
+
+/* ---- Header ---------------------------------------------------------- */
+#app-header {
+    height: 9;
+    background: $bc-panel;
+    padding: 0 1;
+    border: solid $bc-emerald;
+}
+
+#branding {
+    width: 57;
+    min-width: 57;
+    padding: 0 1;
+    color: $bc-emerald;
+    text-style: bold;
+}
+
+#conn-info {
+    width: 1fr;
+    height: 100%;
+    padding: 0 1;
+    border-left: solid $bc-emerald;
+    background: $bc-panel;
+    color: $bc-text;
+}
+
+#net-status {
+    width: 1fr;
+    height: 100%;
+    padding: 0 1;
+    border: solid $bc-emerald;
+    background: $bc-panel-alt;
+    color: $bc-text;
+}
+
+#net-title {
+    height: 2;
+    color: $bc-emerald;
+    text-style: bold;
+    border-bottom: solid $bc-emerald;
+}
+
+#net-body {
+    height: auto;
+    color: $bc-text;
+}
+
+/* Condensed connection summary: only shown when #conn-info is hidden. */
+#conn-line {
+    display: none;
+    height: 1;
+    padding: 0 1;
+    background: $bc-panel;
+    color: $bc-text;
+    text-wrap: nowrap;
+    text-overflow: ellipsis;
+}
+
+/* ---- Conversation ---------------------------------------------------- */
+#conversation {
+    height: 1fr;
+    border: solid $bc-emerald;
+    background: $bc-panel;
+}
+
+#room-header {
+    height: 2;
+    background: $bc-bar;
+    border-bottom: solid $bc-emerald;
+    padding: 0 1;
+}
+
+#room-spacer {
+    width: 1fr;
+}
+
+#room-name {
+    width: auto;
+    color: $bc-emerald;
+    text-style: bold;
+}
+
+#room-sep {
+    width: auto;
+    color: $bc-muted;
+    padding: 0 1;
+}
+
+#room-online {
+    width: auto;
+    color: $bc-text;
+    padding: 0 1;
+}
+
+#room-hint {
+    width: auto;
+    color: $bc-muted;
+}
+
+#chat {
+    height: 1fr;
+    border: none;
+    background: $bc-panel;
+    padding: 0 1;
+    scrollbar-color: $bc-emerald;
+    scrollbar-background: $bc-panel;
+    scrollbar-size-vertical: 1;
+}
+
+/* ---- Input ----------------------------------------------------------- */
+#input-panel {
+    height: 3;
+    background: $bc-panel-alt;
+    border: solid $bc-emerald;
+    padding: 0 1;
+}
+
+#input-prompt {
+    width: 2;
+    color: $bc-emerald;
+    text-style: bold;
+}
+
+#input {
+    width: 1fr;
+    height: 1;
+    border: none;
+    background: transparent;
+    color: $bc-text;
+}
+
+#input > .input--cursor {
+    background: $bc-emerald;
+    color: $bc-bg;
+}
+
+#input > .input--placeholder {
+    color: $bc-muted;
+}
+
+#input-hint {
+    width: auto;
+    padding: 0 1;
+}
+
+/* ---- Footer ---------------------------------------------------------- */
+#footer {
+    height: 3;
+    background: $bc-bg;
+    padding: 0 1;
+    border: solid $bc-emerald;
+}
+
+KeyHint {
+    width: auto;
+    height: 1;
+}
+
+.keycap {
+    width: auto;
+    height: 1;
+    padding: 0 1;
+    border-left: solid $bc-emerald;
+    border-right: solid $bc-emerald;
+    color: $bc-emerald;
+}
+
+.keylabel {
+    width: auto;
+    height: 1;
+    padding: 0 1 0 1;
+    color: $bc-muted;
+}
+
+#footer-div {
+    width: auto;
+    height: 1;
+    padding: 0 1;
+    color: $bc-emerald;
+}
+
+#footer-status {
+    width: auto;
+    height: 1;
+    padding: 0 1;
+}
+
+#footer-spacer {
+    width: 1fr;
+    height: 1;
+}
+
+/* ---- Settings modal -------------------------------------------------- */
+SettingsScreen {
+    align: center middle;
+    background: $bc-bg 60%;
+}
+
+#settings-box {
+    width: 50;
+    height: auto;
+    border: solid $bc-emerald;
+    background: $bc-panel;
+    padding: 1 2;
+}
+
+#settings-title {
+    color: $bc-emerald;
+    text-style: bold;
+}
+
+#settings-label {
+    color: $bc-muted;
+    margin-top: 1;
+}
+
+#settings-nick {
+    border: solid $bc-emerald;
+    background: $bc-panel-alt;
+    color: $bc-text;
+}
+
+#settings-hint {
+    margin-top: 1;
+}
+
+/* ---- Responsive breakpoints (classes set on Screen from on_resize) --- */
+.-wide .keylabel { padding: 0 3 0 1; }
+
+.-medium #conn-info { display: none; }
+.-medium #conn-line { display: block; }
+.-medium #room-hint { display: none; }
+
+.-narrow #conn-info { display: none; }
+.-narrow #conn-line { display: block; }
+.-narrow #room-hint { display: none; }
+.-narrow #branding { width: 1fr; min-width: 0; }
+.-narrow #app-header { height: 6; }
+.-narrow #net-status { border: none; }
+.-narrow #net-title { height: 1; border-bottom: none; }
+.-narrow #footer-status { display: none; }
+.-narrow #footer-div { display: none; }
+
+.-tiny #conn-info { display: none; }
+.-tiny #conn-line { display: block; }
+.-tiny #net-status { display: none; }
+.-tiny #room-hint { display: none; }
+.-tiny #branding { width: 1fr; min-width: 0; }
+.-tiny #app-header { height: 5; }
+.-tiny #footer-status { display: none; }
+.-tiny #footer-div { display: none; }

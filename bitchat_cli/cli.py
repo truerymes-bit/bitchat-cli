@@ -1,11 +1,5 @@
 # cli.py
-import asyncio
 import os
-
-from prompt_toolkit import PromptSession, print_formatted_text
-from prompt_toolkit.completion import WordCompleter
-from prompt_toolkit.formatted_text import ANSI
-from prompt_toolkit.patch_stdout import patch_stdout
 
 from . import __version__, theme
 from .ble_service import BLEService
@@ -18,24 +12,20 @@ class CLI:
     def __init__(self, state: ChatState):
         self.state = state
         self.ble_service = BLEService(state, self.redraw_prompt)
-        self.session = PromptSession(
-            completer=WordCompleter(
-                ["/w", "/peers", "/dm", "/route", "/verify", "/unverify", "/name", "/send", "/file", "/clear", "/sync", "/topology", "/help"], ignore_case=True
-            )
-        )
+        self.session = None
 
     def redraw_prompt(self):
-        if self.session.app:
-            self.session.app.invalidate()
+        pass
+
+    def clear_screen(self):
+        """Clear the visible display only. Overridden by the TUI."""
+        print("\033c", end="")
 
     def get_prompt_message(self):
-        # ANSI() lets prompt_toolkit render the coloured prompt correctly.
-        return ANSI(theme.prompt(self.state.nickname))
+        return None
 
     def _out(self, line: str):
-        # ANSI(...) so prompt_toolkit renders the colour codes (a plain print()
-        # under patch_stdout() would show the escape sequences literally).
-        print_formatted_text(ANSI(line))
+        print(line)
         self.redraw_prompt()
 
     async def handle_command(self, text: str):
@@ -49,7 +39,7 @@ class CLI:
                 n = len(self.state.peer_nicknames)
                 self._out(theme.system(f"Known peers ({n}):"))
                 for peer_id, nick in self.state.peer_nicknames.items():
-                    name = theme.sgr(nick, theme.BOLD, theme.nick_color(nick))
+                    name = theme.sgr(nick, theme.BOLD, theme.REMOTE)
                     self._out(f"  {name} {theme.sgr(peer_id, theme.PATH)}")
         elif cmd == "/peers":
             if not getattr(self.state, 'peer_info', None):
@@ -191,7 +181,7 @@ class CLI:
                     for a, b in unconf:
                         self._out(f"  {a[:8]} -> {b[:8]} (one-way)")
         elif cmd == "/clear":
-            print("\033c", end="")
+            self.clear_screen()
         elif cmd == "/help":
             self._out(theme.system("Commands:"))
             for name, desc in (
@@ -217,29 +207,3 @@ class CLI:
                 self._out(theme.warn(f"To send a file, use:  /send {text.strip()}"))
             else:
                 self._out(theme.warn(f"Unknown command: {cmd}. Type /help for commands."))
-
-    async def run(self):
-        print_formatted_text(ANSI(theme.banner(
-            self.state.nickname, self.state.my_peer_id_hex, __version__)))
-
-        ble_task = None
-        try:
-            with patch_stdout():
-                ble_task = asyncio.create_task(self.ble_service.run())
-                while True:
-                    self.session.message = self.get_prompt_message
-                    text = await self.session.prompt_async()
-                    if not text.strip():
-                        continue
-                    if text.startswith("/"):
-                        await self.handle_command(text)
-                    else:
-                        # send_public_message renders the local echo via the theme.
-                        await self.ble_service.send_public_message(text)
-        except (EOFError, KeyboardInterrupt):
-            print("\n" + theme.system("Shutting down…"))
-        finally:
-            if ble_task:
-                ble_task.cancel()
-            await self.ble_service.stop()
-            print(theme.system("Shutdown complete."))
