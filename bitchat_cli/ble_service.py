@@ -96,8 +96,7 @@ DM_HANDSHAKE_TIMEOUT = 8.0    # seconds to wait for that handshake to finish
 
 
 def _hs_debug(msg: str) -> None:
-    """Debug: print and append a handshake trace line to the debug log."""
-    print(msg, flush=True)
+    """Debug: append a handshake trace line to the debug log only."""
     dlog(msg)
 
 class NoiseSession:
@@ -705,7 +704,6 @@ class BLEService:
                 return
 
             except Exception as e:
-                print(f"DM_RECV_ERROR: {e}", flush=True)
                 dlog(f"DM_RECV_ERROR: {e}")
             return
         # Handle gossip sync requests (Phase 4)
@@ -1208,7 +1206,6 @@ class BLEService:
                 payload=ciphertext,
                 ttl=DEFAULT_TTL,  # match Android: encrypted DMs use TTL 7 so other peers relay them
             ))
-            print(f"DM_SEND: sender={self.state.my_peer_id.hex()} recipient={peer_id_hex} ttl={DEFAULT_TTL}", flush=True)
             dlog(f"DM_SEND: sender={self.state.my_peer_id.hex()} recipient={peer_id_hex} ttl={DEFAULT_TTL}")
             await self._broadcast(packet)
             self._pending_acks[msg_id] = {"peer_id": peer_id_hex, "content": content, "time": time.monotonic(), "retries": 0}

@@ -81,7 +81,6 @@ class BitchatPeripheral:
                     if packet is not None:
                         outer.dispatch_fn(packet, addr)
                 except Exception as e:
-                    print(f"PERIPHERAL_WRITE_ERROR: {e}", flush=True)
                     dlog(f"PERIPHERAL_WRITE_ERROR: {e}")
 
         self._service = BitchatService()
