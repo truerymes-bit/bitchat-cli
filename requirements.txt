@@ -1,3 +1,4 @@
 cryptography>=3.4.8
 prompt-toolkit>=3.0.43
 noiseprotocol>=0.3.1
+textual>=8.2.7

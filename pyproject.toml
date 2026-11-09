@@ -26,6 +26,7 @@ dependencies = [
     "cryptography>=3.4.8",
     "prompt-toolkit>=3.0.43",
     "noiseprotocol>=0.3.1",
+    "textual>=8.2.7",
 ]
 
 [project.urls]
@@ -39,6 +40,9 @@ bitchat = "bitchat_cli.main:main"
 
 [tool.setuptools]
 packages = ["bitchat_cli", "bitchat_cli.sync"]
+
+[tool.setuptools.package-data]
+bitchat_cli = ["app.tcss"]
 
 [tool.setuptools.dynamic]
 version = { attr = "bitchat_cli.__version__" }
