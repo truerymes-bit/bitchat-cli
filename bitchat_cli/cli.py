@@ -1,5 +1,6 @@
 # cli.py
 import os
+import time
 
 from . import __version__, theme
 from .ble_service import BLEService
@@ -13,6 +14,7 @@ class CLI:
         self.state = state
         self.ble_service = BLEService(state, self.redraw_prompt)
         self.session = None
+        self._start_time = time.monotonic()
 
     def redraw_prompt(self):
         pass
@@ -65,6 +67,9 @@ class CLI:
                     if sess is not None:
                         status = "✓ encrypted" if sess.is_finished else "…handshake"
                         self._out(f"    noise:       {status}")
+            # The local client, reported last and marked clearly so the room header
+            # (+1 counts me) stays in sync with this list.
+            self._out(theme.system(f"  ↳ you (you)  {theme.sgr(self.state.nickname or 'unnamed', theme.BOLD)}"))
         elif cmd == "/dm":
             if len(parts) < 3:
                 self._out(theme.warn("Usage: /dm <peer_id_prefix> <message>"))
@@ -180,6 +185,15 @@ class CLI:
                     self._out(theme.system(f"Unconfirmed edges ({len(unconf)}):"))
                     for a, b in unconf:
                         self._out(f"  {a[:8]} -> {b[:8]} (one-way)")
+        elif cmd == "/status":
+            connected = sorted(self.state.connected_addresses)
+            sessions = sum(
+                1 for sess in self.ble_service._noise_sessions.values() if sess.is_finished
+            )
+            self._out(theme.system(f"Connected devices: {', '.join(connected) if connected else 'none'})"))
+            self._out(theme.system(f"My peer ID:     {self.state.my_peer_id_hex}"))
+            self._out(theme.system(f"Completed Noise sessions: {sessions}"))
+            self._out(theme.system(f"Uptime: {self._format_uptime(time.monotonic() - self._start_time)}"))
         elif cmd == "/clear":
             self.clear_screen()
         elif cmd == "/help":
@@ -207,3 +221,9 @@ class CLI:
                 self._out(theme.warn(f"To send a file, use:  /send {text.strip()}"))
             else:
                 self._out(theme.warn(f"Unknown command: {cmd}. Type /help for commands."))
+
+    @staticmethod
+    def _format_uptime(seconds: float) -> str:
+        m, s = divmod(int(seconds), 60)
+        h, m = divmod(m, 60)
+        return f"{h:02d}:{m:02d}:{s:02d}"

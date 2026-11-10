@@ -1,9 +1,9 @@
 """Textual presentation layer for bitchat-cli (Stage 4: design system widgets)."""
+
 from __future__ import annotations
 
 import asyncio
 import os
-import time
 from pathlib import Path
 
 os.environ.setdefault("BITCHAT_FORCE_COLOR", "1")
@@ -22,11 +22,8 @@ from .screens import SettingsScreen
 from .widgets import (
     AppFooter,
     AppHeader,
-    ConnectionInfo,
-    ConnectionLine,
     ConversationView,
     InputPanel,
-    NetworkStatusPanel,
     RoomHeader,
 )
 from . import palette, theme
@@ -66,11 +63,9 @@ class BitchatApp(App):
         self.ble_service._emit = lambda line: self.event_bus.publish_nowait(
             AppEvent(EventType.OUTPUT, line)
         )
-        self._start_time = time.monotonic()
 
     def compose(self) -> ComposeResult:
         yield AppHeader(id="app-header")
-        yield ConnectionLine(id="conn-line")
         with Vertical(id="conversation"):
             yield RoomHeader(id="room-header")
             yield ConversationView(id="chat")
@@ -149,41 +144,27 @@ class BitchatApp(App):
 
     def _refresh_status(self) -> None:
         try:
-            conn = self.query_one("#conn-info", ConnectionInfo)
-            line = self.query_one("#conn-line", ConnectionLine)
-            net = self.query_one("#net-status", NetworkStatusPanel)
-            footer = self.query_one("#footer", AppFooter)
-            room_online = self.query_one("#room-online", Static)
+            header = self.query_one(AppHeader)
+            room = self.query_one("#room-header", RoomHeader)
         except Exception:
             return
         st = self.state
-        peer_mac = next(iter(st.connected_addresses), "—")
-        uptime = self._format_uptime(time.monotonic() - self._start_time)
-        # Sessions = completed Noise sessions (not merely known peers).
-        sessions = sum(1 for sess in self.ble_service._noise_sessions.values()
-                       if sess.is_finished)
-        conn.update_info(peer_mac, st.my_peer_id_hex, sessions, uptime)
-        line.update_info(peer_mac, st.my_peer_id_hex, sessions, uptime)
-        # Network Status label is the directly connected peer's nickname.
-        label = "Transport"
-        for pid in st.direct_peers:
-            label = st.nickname_for(pid)
-            break
-        peers = len(st.peer_nicknames)
-        net.update_status(
-            label=label,
-            status="Online" if self.ble_service._running else "Offline",
-            peers=peers,
-        )
-        online = peers + 1  # remote peers plus ourselves
-        footer.update_footer(online=online)
-        room_online.update(f"{online} online")
-
-    @staticmethod
-    def _format_uptime(seconds: float) -> str:
-        m, s = divmod(int(seconds), 60)
-        h, m = divmod(m, 60)
-        return f"{h:02d}:{m:02d}:{s:02d}"
+        # Link state: a dot plus one word (Connected / Searching / Offline).
+        # Use the existing state: ble_service._running and state.connected_addresses
+        # / direct_peers. Connected means at least one connected peer.
+        if self.ble_service._running:
+            if st.connected_addresses or st.direct_peers:
+                col = palette.EMERALD
+                label = "Connected"
+            else:
+                col = palette.MUTED
+                label = "Searching"
+        else:
+            col = palette.RED
+            label = "Offline"
+        header.update_link("●", col, label, col)
+        # Room-header online count (counts me).
+        room.update_online(len(st.peer_nicknames) + 1)
 
     def _append_line(self, line: str) -> None:
         try:

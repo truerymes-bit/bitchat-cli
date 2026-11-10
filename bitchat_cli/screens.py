@@ -25,6 +25,7 @@ class SettingsScreen(ModalScreen):
             yield Static("Settings", id="settings-title")
             yield Static("Nickname", id="settings-label")
             yield Input(value=self._nickname, id="settings-nick")
+            yield Static(f"Your ID: <{self.state.my_peer_id_hex}>", id="settings-id")
             yield Static(
                 Text.assemble(
                     ("[Enter]", f"bold {palette.EMERALD}"), (" Apply   ", palette.MUTED),

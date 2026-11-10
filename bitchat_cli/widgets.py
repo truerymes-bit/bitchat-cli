@@ -1,124 +1,47 @@
 """Reusable Textual widgets for the bitchat TUI."""
+
 from __future__ import annotations
 
 from rich.text import Text
 from textual.app import ComposeResult
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal
 from textual.widgets import Input, RichLog, Static
 
-from . import palette, theme
+from . import palette
 
 
-class BrandingPanel(Static):
-    def __init__(self, version: str = "0.3.0", **kwargs):
+class AppHeader(Horizontal):
+    def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.version = version
 
-    def render(self):
-        t = Text(no_wrap=True, overflow="crop")
-        lines = theme._LOGO.strip("\n").splitlines()
-        logo_w = max(len(ln) for ln in lines)
-        sub = f"C L I  •  v{self.version}"
-        if self.size.width >= logo_w:
-            t.append("\n".join(lines) + "\n", style=f"bold {palette.EMERALD}")
-            t.append(sub.center(logo_w), style=palette.MUTED)
-        else:
-            # Compact wordmark for narrow terminals (no wrapping/clipping).
-            t.append("B I T C H A T\n", style=f"bold {palette.EMERALD}")
-            t.append(sub, style=palette.MUTED)
-        return t
-
-
-class ConnectionInfo(Static):
-    """Full connection block (wide terminals)."""
-
-    def update_info(self, peer_mac: str, peer_id: str, sessions: int, uptime: str) -> None:
-        connected = peer_mac not in ("—", "", None)
-        t = Text()
-        if connected:
-            t.append("●  ", style=palette.EMERALD)
-            t.append("Connected to: ", style=palette.EMERALD)
-            t.append(f"{peer_mac}\n", style=palette.TEXT)
-        else:
-            t.append("●  ", style=palette.RED)
-            t.append("Disconnected\n", style=palette.RED)
-        for icon, label, value, last in (
-            ("📡", "Peer: ", peer_id, False),
-            ("👥", "Sessions: ", str(sessions), False),
-            ("🕒", "Uptime: ", uptime, True),
-        ):
-            t.append(f"{icon} ")
-            t.append(label, style=palette.MUTED)
-            t.append(value + ("" if last else "\n"), style=palette.TEXT)
-        self.update(t)
-
-
-class ConnectionLine(Static):
-    """Condensed one-line connection summary (shown when the full block is hidden)."""
-
-    def update_info(self, peer_mac: str, peer_id: str, sessions: int, uptime: str) -> None:
-        connected = peer_mac not in ("—", "", None)
-        t = Text(no_wrap=True, overflow="ellipsis")
-        t.append("● ", style=palette.EMERALD if connected else palette.RED)
-        if connected:
-            t.append(f"{peer_mac}", style=palette.TEXT)
-        else:
-            t.append("Disconnected", style=palette.RED)
-        sep = ("  │  ", palette.MUTED)
-        t.append(*sep)
-        t.append("Peer ", style=palette.MUTED)
-        t.append(peer_id, style=palette.TEXT)
-        t.append(*sep)
-        t.append("Sessions ", style=palette.MUTED)
-        t.append(str(sessions), style=palette.TEXT)
-        t.append(*sep)
-        t.append("Up ", style=palette.MUTED)
-        t.append(uptime, style=palette.TEXT)
-        self.update(t)
-
-
-class NetworkStatusPanel(Vertical):
     def compose(self) -> ComposeResult:
-        yield Static("Network Status", id="net-title")
-        yield Static("", id="net-body")
+        yield Static("B I T C H A T", id="wordmark")
+        with Horizontal():
+            yield Static("●", id="link-dot")
+            yield Static("Offline", id="link-state")
 
-    def update_status(self, label: str, status: str, peers: int, rng: str = "Local") -> None:
-        online = status == "Online"
-        t = Text()
-        t.append(f"{label}: ", style=palette.TEXT)
-        t.append(status + "\n", style=f"bold {palette.EMERALD if online else palette.RED}")
-        t.append("Peers: ", style=palette.TEXT)
-        t.append(str(peers) + "\n", style=f"bold {palette.EMERALD}")
-        t.append("Range: ", style=palette.TEXT)
-        t.append(rng, style=palette.TEXT)
+    def update_link(self, dot: str, dot_color: str, label: str, label_color: str) -> None:
         try:
-            self.query_one("#net-body", Static).update(t)
+            self.query_one("#link-dot", Static).update(Text(dot, style=dot_color))
+            self.query_one("#link-state", Static).update(Text(label, style=label_color))
         except Exception:
             pass
 
 
-class AppHeader(Horizontal):
-    def __init__(self, version: str = "0.3.0", **kwargs):
-        super().__init__(**kwargs)
-        self.version = version
-
-    def compose(self) -> ComposeResult:
-        yield BrandingPanel(self.version, id="branding")
-        yield ConnectionInfo(id="conn-info")
-        yield NetworkStatusPanel(id="net-status")
-
-
 class RoomHeader(Horizontal):
-    def __init__(self, room: str = "# General", **kwargs):
+    def __init__(self, room: str = "# General", online: int = 1, **kwargs):
         super().__init__(**kwargs)
         self.room = room
+        self.online = online
 
     def compose(self) -> ComposeResult:
-        yield Static(f"👥 {self.room}", id="room-name")
-        yield Static("|", id="room-sep")
-        yield Static("1 online", id="room-online")
-        yield Static("", id="room-spacer")
-        yield Static(Text("[ ↑/↓ to navigate ]", style=palette.MUTED), id="room-hint")
+        yield Static(f"{self.room} · {self.online} online", id="room-online")
+
+    def update_online(self, online: int) -> None:
+        try:
+            self.query_one("#room-online", Static).update(f"{self.room} · {online} online")
+        except Exception:
+            pass
 
 
 class ConversationView(RichLog):
@@ -155,25 +78,18 @@ class KeyHint(Horizontal):
 
 
 class AppFooter(Horizontal):
-    def compose(self) -> ComposeResult:
-        for key, label in (("F1", "Help"), ("F2", "Peers"), ("F3", "Clear"), ("F4", "Settings")):
-            yield KeyHint(key, label)
-        yield Static("│", id="footer-div")
-        yield Static(self._status_text(1), id="footer-status")
-        yield Static("", id="footer-spacer")
-        yield KeyHint("Ctrl+Q", "Quit")
-
-    @staticmethod
-    def _status_text(online: int, rooms: int = 1) -> Text:
-        return Text.assemble(
-            ("▲ ", palette.EMERALD),
-            (f"{online} online", f"bold {palette.EMERALD}"),
-            (" • ", palette.MUTED),
-            (f"{rooms} room", palette.MUTED),
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._keys = (
+            ("F1", "Help"),
+            ("F2", "Peers"),
+            ("F3", "Clear"),
+            ("F4", "Settings"),
+            ("Ctrl+Q", "Quit"),
         )
 
-    def update_footer(self, online: int, rooms: int = 1) -> None:
-        try:
-            self.query_one("#footer-status", Static).update(self._status_text(online, rooms))
-        except Exception:
-            pass
+    def compose(self) -> ComposeResult:
+        for idx, (key, label) in enumerate(self._keys):
+            if idx:
+                yield Static(" ", classes="footer-spacer")
+            yield KeyHint(key=key, label=label)
