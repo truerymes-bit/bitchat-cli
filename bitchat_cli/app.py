@@ -94,7 +94,10 @@ class BitchatApp(App):
             pass
 
     def action_show_settings(self) -> None:
-        self.push_screen(SettingsScreen(self.state.nickname), self._apply_settings)
+        self.push_screen(
+            SettingsScreen(self.state.nickname, self.state.my_peer_id_hex),
+            self._apply_settings,
+        )
 
     async def _apply_settings(self, nickname) -> None:
         # Reuses the existing /name path (persists nickname + re-announces).

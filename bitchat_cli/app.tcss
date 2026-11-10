@@ -7,13 +7,14 @@ Screen {
 
 /* ---- Header ---------------------------------------------------------- */
 #app-header {
-    height: 9;
+    height: 3;
     background: $bc-panel;
     padding: 0 1;
     border: solid $bc-emerald;
 }
 
 #wordmark {
+    width: 1fr;
     text-style: bold;
     color: $bc-emerald;
 }
@@ -22,7 +23,12 @@ Screen {
     height: 100%;
 }
 
+#app-header > Horizontal:last-child {
+    width: auto;
+}
+
 #link-dot, #link-state {
+    width: auto;
     text-style: bold;
     color: $bc-muted;
 }
@@ -78,6 +84,11 @@ Screen {
     color: $bc-text;
 }
 
+#input-hint {
+    width: auto;
+    padding: 0 1;
+}
+
 #input > .input--cursor {
     background: $bc-emerald;
     color: $bc-bg;
@@ -112,7 +123,7 @@ KeyHint {
 .keylabel {
     width: auto;
     height: 1;
-    padding: 0 1;
+    padding: 0 2 0 1;
     color: $bc-muted;
 }
 

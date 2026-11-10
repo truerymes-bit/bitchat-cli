@@ -90,6 +90,6 @@ class AppFooter(Horizontal):
 
     def compose(self) -> ComposeResult:
         for idx, (key, label) in enumerate(self._keys):
-            if idx:
-                yield Static(" ", classes="footer-spacer")
+            if key == "Ctrl+Q":
+                yield Static("", classes="footer-spacer")
             yield KeyHint(key=key, label=label)

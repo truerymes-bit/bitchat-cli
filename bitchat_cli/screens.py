@@ -16,16 +16,17 @@ class SettingsScreen(ModalScreen):
 
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
 
-    def __init__(self, nickname: str):
+    def __init__(self, nickname: str, peer_id: str):
         super().__init__()
         self._nickname = nickname
+        self._peer_id = peer_id
 
     def compose(self) -> ComposeResult:
         with Vertical(id="settings-box"):
             yield Static("Settings", id="settings-title")
             yield Static("Nickname", id="settings-label")
             yield Input(value=self._nickname, id="settings-nick")
-            yield Static(f"Your ID: <{self.state.my_peer_id_hex}>", id="settings-id")
+            yield Static(f"Your ID: <{self._peer_id}>", id="settings-id")
             yield Static(
                 Text.assemble(
                     ("[Enter]", f"bold {palette.EMERALD}"), (" Apply   ", palette.MUTED),
