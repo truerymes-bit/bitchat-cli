@@ -108,10 +108,6 @@ TERMINAL_DM_STATES = ("delivered", "read", "failed")
 DM_STATE_RANK = {"sending": 0, "failed": 0, "sent": 1, "unconfirmed": 1, "delivered": 2, "read": 3}
 
 
-def _hs_debug(msg: str) -> None:
-    """Debug: append a handshake trace line to the debug log only."""
-    dlog(msg)
-
 class NoiseSession:
     """Manages a Noise_XX handshake and transport encryption with one peer."""
     def __init__(self, our_noise_priv: bytes, peer_noise_pub: bytes, is_initiator: bool, clock=time.monotonic):
@@ -212,10 +208,11 @@ class NoiseSession:
 class BLEService:
     """Central-role BLE transport speaking the real bitchat public-chat protocol."""
 
-    def __init__(self, state: ChatState, cli_redraw_callback, clock=time.monotonic):
+    def __init__(self, state: ChatState, cli_redraw_callback, clock=time.monotonic, log=dlog):
         self.state = state
         self.cli_redraw = cli_redraw_callback
         self.clock = clock  # outbox/session timing; injectable for tests
+        self._log = log     # debug log sink; injectable for tests
         self.clients: Dict[str, BleakClient] = {}      # BLE address -> client
         self._connecting: Set[str] = set()
         self._write_locks: Dict[str, asyncio.Lock] = {}  # BLE address -> write lock
@@ -344,7 +341,7 @@ class BLEService:
                     if pub is None:
                         continue
                     attempts[pid] = attempts.get(pid, 0) + 1
-                    dlog(f"HS_RETRY: peer={pid[:8]} attempt={attempts[pid]}")
+                    self._log(f"HS_RETRY: peer={pid[:8]} attempt={attempts[pid]}")
                     self._initiate_noise_handshake(pid, pub)
         except asyncio.CancelledError:
             raise
@@ -583,15 +580,15 @@ class BLEService:
         if packet.type == MessageType.NOISE_HANDSHAKE:
             peer_id = packet.sender_id.hex()
             _s = self._noise_sessions.get(peer_id)
-            _hs_debug(f"HS_RECV: from={peer_id[:8]} to={packet.recipient_id.hex()[:8] if packet.recipient_id else None} len={len(packet.payload)} ttl={packet.ttl} session={'none' if _s is None else ('finished' if _s.is_finished else ('initiator' if _s.is_initiator else 'responder'))}")
+            self._log(f"HS_RECV: from={peer_id[:8]} to={packet.recipient_id.hex()[:8] if packet.recipient_id else None} len={len(packet.payload)} ttl={packet.ttl} session={'none' if _s is None else ('finished' if _s.is_finished else ('initiator' if _s.is_initiator else 'responder'))}")
             # Check if this is for us
             if packet.recipient_id is not None and packet.recipient_id != self.state.my_peer_id:
-                _hs_debug("HS_DROP: not for us")
+                self._log("HS_DROP: not for us")
                 return  # not for us
             # Get peer's noise public key
             peer_noise_pub = self.state.get_peer_noise_key(peer_id)
             if peer_noise_pub is None:
-                _hs_debug("HS_DROP: unknown peer noise key")
+                self._log("HS_DROP: unknown peer noise key")
                 return  # unknown peer, drop
             # Drop duplicate handshake frames (same peer + first 16 payload bytes),
             # matching Android SecurityManager's processedKeyExchanges check.
@@ -600,7 +597,7 @@ class BLEService:
                 self._seen_handshakes = OrderedDict()
             hs_key = (peer_id, bytes(packet.payload[:16]))
             if hs_key in self._seen_handshakes:
-                _hs_debug("HS_DROP: duplicate")
+                self._log("HS_DROP: duplicate")
                 return
             self._seen_handshakes[hs_key] = None
             while len(self._seen_handshakes) > 500:
@@ -627,7 +624,7 @@ class BLEService:
                 session._last_error = None
                 self._noise_sessions.pop(peer_id, None)
                 return
-            _hs_debug(f"HS_RESULT: peer={peer_id[:8]} response_len={len(response) if response else 0} finished={session.is_finished}")
+            self._log(f"HS_RESULT: peer={peer_id[:8]} response_len={len(response) if response else 0} finished={session.is_finished}")
             if response:
                 # Send response
                 resp_packet = self._sign(BitchatPacket(
@@ -658,12 +655,12 @@ class BLEService:
                 noise_type = plaintext[0]
                 if noise_type == 0x03:  # DELIVERED (Android NoisePayloadType.DELIVERED)
                     ack_msg_id = plaintext[1:].decode('utf-8', errors='replace')
-                    dlog(f"DM_ACK_RECV: from={peer_id[:8]} msg_id={ack_msg_id}")
+                    self._log(f"DM_ACK_RECV: from={peer_id[:8]} msg_id={ack_msg_id}")
                     self._set_dm_state(ack_msg_id, "delivered")
                     return
                 if noise_type == 0x02:  # READ_RECEIPT (Android NoisePayloadType.READ_RECEIPT)
                     read_msg_id = plaintext[1:].decode('utf-8', errors='replace')
-                    dlog(f"DM_READ_RECV: from={peer_id[:8]} msg_id={read_msg_id}")
+                    self._log(f"DM_READ_RECV: from={peer_id[:8]} msg_id={read_msg_id}")
                     self._set_dm_state(read_msg_id, "read")
                     return
                 if noise_type != 0x01:  # PRIVATE_MESSAGE only
@@ -707,7 +704,7 @@ class BLEService:
                 return
 
             except Exception as e:
-                dlog(f"DM_RECV_ERROR: {e}")
+                self._log(f"DM_RECV_ERROR: {e}")
             return
         # Handle gossip sync requests (Phase 4)
         if packet.type == MessageType.REQUEST_SYNC:
@@ -1145,10 +1142,10 @@ class BLEService:
         """Send a DELIVERED (0x03) ack for a received DM, mirroring Android's sendDeliveryAck."""
         session = self._noise_sessions.get(recipient_peer_id)
         if session is None:
-            dlog(f"DM_ACK_SKIP: no session peer={recipient_peer_id[:8]} msg_id={message_id}")
+            self._log(f"DM_ACK_SKIP: no session peer={recipient_peer_id[:8]} msg_id={message_id}")
             return
         if not session.is_finished:
-            dlog(f"DM_ACK_SKIP: session not finished peer={recipient_peer_id[:8]} msg_id={message_id}")
+            self._log(f"DM_ACK_SKIP: session not finished peer={recipient_peer_id[:8]} msg_id={message_id}")
             return
         try:
             ack_payload = bytes([0x03]) + message_id.encode('utf-8')
@@ -1161,9 +1158,9 @@ class BLEService:
                 ttl=DEFAULT_TTL,
             ))
             await self._broadcast(packet)
-            dlog(f"DM_ACK_SEND: to={recipient_peer_id[:8]} msg_id={message_id}")
+            self._log(f"DM_ACK_SEND: to={recipient_peer_id[:8]} msg_id={message_id}")
         except Exception as e:
-            dlog(f"DM_ACK_SEND failed: to={recipient_peer_id[:8]} msg_id={message_id} err={e}")
+            self._log(f"DM_ACK_SEND failed: to={recipient_peer_id[:8]} msg_id={message_id} err={e}")
 
     # ------------------------------------------------------------------ #
     # DM outbox (modeled on Android MessageRouter: enqueue, tickOutbox, handshake backoff)
@@ -1178,10 +1175,10 @@ class BLEService:
             return True
         session = self._noise_sessions.get(peer_id_hex)
         if session is None:
-            dlog(f"DM_READ_SKIP: no session peer={peer_id_hex[:8]} msg_id={message_id}")
+            self._log(f"DM_READ_SKIP: no session peer={peer_id_hex[:8]} msg_id={message_id}")
             return False
         if not session.is_finished:
-            dlog(f"DM_READ_SKIP: session not finished peer={peer_id_hex[:8]} msg_id={message_id}")
+            self._log(f"DM_READ_SKIP: session not finished peer={peer_id_hex[:8]} msg_id={message_id}")
             return False
         try:
             payload = session.encrypt(bytes([0x02]) + message_id.encode('utf-8'))
@@ -1194,10 +1191,10 @@ class BLEService:
             ))
             await self._broadcast(packet)
             self._sent_read_receipts.add(message_id)
-            dlog(f"DM_READ_SEND: to={peer_id_hex[:8]} msg_id={message_id}")
+            self._log(f"DM_READ_SEND: to={peer_id_hex[:8]} msg_id={message_id}")
             return True
         except Exception as e:
-            dlog(f"DM_READ_SEND failed: to={peer_id_hex[:8]} msg_id={message_id} err={e}")
+            self._log(f"DM_READ_SEND failed: to={peer_id_hex[:8]} msg_id={message_id} err={e}")
             return False
 
     async def read_receipts_for_peer(self, peer_id_hex: str) -> None:
@@ -1221,18 +1218,22 @@ class BLEService:
     def _set_dm_state(self, msg_id: str, new: str) -> bool:
         """Move an outgoing DM to `new`. Never downgrades. Returns True if changed."""
         e = self._outbox.get(msg_id)
-        if e is None or e["state"] == "failed":
+        if e is None:
             return False
         old = e["state"]
+        if old == "failed" and not e.get("sent_then_failed"):
+            return False  # expired while queued: never transmitted, so final
         if new == "unconfirmed":
             ok = old == "sent"
         elif new == "failed":
-            ok = old == "sending"
+            ok = old in ("sending", "unconfirmed")
         else:
             ok = DM_STATE_RANK[new] > DM_STATE_RANK[old]
         if ok:
+            if new == "failed" and old == "unconfirmed":
+                e["sent_then_failed"] = True
             e["state"] = new
-            dlog(f"DM_STATE: msg_id={msg_id[:8]} {old}->{new}")
+            self._log(f"DM_STATE: msg_id={msg_id[:8]} {old}->{new}")
             self.dm_status_cb(e["peer_id"], msg_id, new)
             if new in TERMINAL_DM_STATES:
                 self._prune_outbox(e["peer_id"])
@@ -1258,7 +1259,7 @@ class BLEService:
     async def _transmit_dm(self, peer_id_hex: str, content: str, msg_id: str) -> bool:
         """Encrypt and broadcast one NOISE_ENCRYPTED DM. False if no ready session."""
         if not self._dm_session_ready(peer_id_hex):
-            dlog(f"DM_SEND_SKIP: no ready session peer={peer_id_hex[:8]} msg_id={msg_id}")
+            self._log(f"DM_SEND_SKIP: no ready session peer={peer_id_hex[:8]} msg_id={msg_id}")
             return False
         session = self._noise_sessions[peer_id_hex]
         try:
@@ -1275,7 +1276,7 @@ class BLEService:
                 payload=ciphertext,
                 ttl=DEFAULT_TTL,  # match Android: encrypted DMs use TTL 7 so other peers relay them
             ))
-            dlog(f"DM_SEND: sender={self.state.my_peer_id.hex()} recipient={peer_id_hex} msg_id={msg_id}")
+            self._log(f"DM_SEND: sender={self.state.my_peer_id.hex()} recipient={peer_id_hex} msg_id={msg_id}")
             await self._broadcast(packet)
             return True
         except Exception as e:
@@ -1307,8 +1308,12 @@ class BLEService:
             if e["state"] == "sending" and now - e["enqueued_at"] > ttl_s:
                 self._set_dm_state(msg_id, "failed")
                 self._warn(f"DM to {self.state.nickname_for(e['peer_id'])} expired before it could be sent.")
-            elif e["state"] == "sent" and now - e["sent_at"] >= DM_UNCONFIRMED_AFTER_S:
+                continue
+            if e["state"] == "sent" and now - e["sent_at"] >= DM_UNCONFIRMED_AFTER_S:
                 self._set_dm_state(msg_id, "unconfirmed")
+            if e["state"] == "unconfirmed" and now - e["sent_at"] > ttl_s:
+                # 24 h without a 0x03: failed. A late receipt can still upgrade it (sent_then_failed).
+                self._set_dm_state(msg_id, "failed")
         queued = []
         for e in self._outbox.values():
             if e["state"] == "sending" and e["peer_id"] not in queued:
@@ -1328,7 +1333,7 @@ class BLEService:
             backoff_ms = HANDSHAKE_RETRY_BACKOFF_MS[min(attempts, len(HANDSHAKE_RETRY_BACKOFF_MS) - 1)]
             self._hs_retry[peer] = (attempts + 1, now + backoff_ms / 1000.0)
             self._needs_announce.add(peer)
-            dlog(f"DM_HS_KICK: peer={peer[:8]} attempt={attempts + 1} next_in_ms={backoff_ms}")
+            self._log(f"DM_HS_KICK: peer={peer[:8]} attempt={attempts + 1} next_in_ms={backoff_ms}")
             self._initiate_noise_handshake(peer, pub)
 
     async def _outbox_loop(self) -> None:
@@ -1339,7 +1344,7 @@ class BLEService:
                 try:
                     await self._outbox_tick()
                 except Exception as e:  # noqa: BLE001 - keep the scheduler alive
-                    dlog(f"OUTBOX_TICK failed: {e}")
+                    self._log(f"OUTBOX_TICK failed: {e}")
         except asyncio.CancelledError:
             raise
 
@@ -1451,7 +1456,7 @@ class BLEService:
                     return
                 except Exception as e:  # noqa: BLE001
                     if "In Progress" in str(e) and attempt < WRITE_RETRIES:
-                        dlog(f"WRITE_RETRY: addr={addr} attempt={attempt + 1}")
+                        self._log(f"WRITE_RETRY: addr={addr} attempt={attempt + 1}")
                         await asyncio.sleep(WRITE_RETRY_DELAY)
                         continue
                     raise
@@ -1559,27 +1564,27 @@ class BLEService:
         self.cli_redraw()
 
     def _sys(self, msg: str, conv: str | None = None):
-        dlog(f"SYS {msg}")
+        self._log(f"SYS {msg}")
         self._emit(theme.system(msg), conv=conv)
 
     def _ok(self, msg: str, conv: str | None = None):
-        dlog(f"OK {msg}")
+        self._log(f"OK {msg}")
         self._emit(theme.ok(msg), conv=conv)
 
     def _warn(self, msg: str, conv: str | None = None):
-        dlog(f"WARN {msg}")
+        self._log(f"WARN {msg}")
         self._emit(theme.warn(msg), conv=conv)
 
     def _err(self, msg: str, conv: str | None = None):
-        dlog(f"ERR {msg}")
+        self._log(f"ERR {msg}")
         self._emit(theme.error(msg), conv=conv)
 
     def _join(self, msg: str, conv: str | None = None):
-        dlog(f"JOIN {msg}")
+        self._log(f"JOIN {msg}")
         self._emit(theme.join(msg), conv=conv)
 
     def _leave(self, msg: str, conv: str | None = None):
-        dlog(f"LEAVE {msg}")
+        self._log(f"LEAVE {msg}")
         self._emit(theme.leave(msg), conv=conv)
 
     def _chat(self, sender: str, content: str, ts_ms=None, is_self: bool = False,

@@ -321,8 +321,9 @@ class FakeClock:
 class RecordingBLEService(_ble.BLEService):
     """BLEService whose outbound packets are recorded instead of written to BLE."""
 
-    def __init__(self, state, clock):
-        super().__init__(state, lambda: None, clock=clock)
+    def __init__(self, state, clock, log=None):
+        self.logs = []  # default debug sink is a list; tests never touch ~/.bitchat
+        super().__init__(state, lambda: None, clock=clock, log=log or self.logs.append)
         self.sent = []    # (clock time, packet)
         self.lines = []   # (conv, line)
         self.dm_status_events = []  # (conv, msg_id, state) from the service hook
@@ -349,9 +350,9 @@ class Phone:
         self.session = None
 
 
-def _make(clock):
+def _make(clock, log=None):
     state = _ChatState(nickname="self", my_peer_id=bytes.fromhex("aa" * 8))
-    svc = RecordingBLEService(state, clock)
+    svc = RecordingBLEService(state, clock, log=log)
     svc._running = True
     phone = Phone()
     state.set_peer_info(phone.peer_hex, "bob",
@@ -605,21 +606,12 @@ def test_read_receipts_once_per_unread_message():
     _aio.run(run())
 
 
-def _kick_logged(peer_hex):
-    """True if DM_HS_KICK for this peer prefix is in the debug log (peer ids are random per run)."""
-    from bitchat_cli.debuglog import LOG_PATH
-    with open(LOG_PATH, "rb") as f:
-        f.seek(0, 2)
-        f.seek(max(0, f.tell() - 262144))
-        tail = f.read().decode("utf-8", errors="replace")
-    return f"DM_HS_KICK: peer={peer_hex[:8]}" in tail
-
-
 def test_no_handshake_until_peer_is_visible():
     clock = FakeClock()
+    logs = []
 
     async def run():
-        svc, phone = _make(clock)
+        svc, phone = _make(clock, log=logs.append)
         svc.state.peer_nicknames.pop(phone.peer_hex)  # key known, peer not visible
         msg_id = await svc.send_private_message(phone.peer_hex, "queued")
         for _ in range(120):  # two minutes of 1 s ticks
@@ -635,7 +627,8 @@ def test_no_handshake_until_peer_is_visible():
         await _aio.sleep(0)
         check("first tick after the peer appears (past backoff) starts a handshake",
               len(svc.handshake_packets()) == before + 1)
-        check("that kick is logged as DM_HS_KICK", _kick_logged(phone.peer_hex))
+        check("that kick is logged as DM_HS_KICK",
+              any(f"DM_HS_KICK: peer={phone.peer_hex[:8]}" in m for m in logs))
 
     _aio.run(run())
 
@@ -720,6 +713,51 @@ def test_unread_incoming_capped_at_500_per_peer():
     _aio.run(run())
 
 
+def test_unconfirmed_fails_after_24h_and_late_receipts_follow_the_rules():
+    clock = FakeClock()
+    ttl = _ble.OUTBOX_MESSAGE_TTL_MS / 1000.0
+
+    async def run():
+        svc, phone = _make(clock)
+        await _establish(svc, phone)
+        # X and Y are sent and never acked; 198 acked DMs follow. 200 records.
+        x = await svc.send_private_message(phone.peer_hex, "X")
+        y = await svc.send_private_message(phone.peer_hex, "Y")
+        for i in range(198):
+            mid = await svc.send_private_message(phone.peer_hex, f"d{i}")
+            _phone_to_service(svc, phone, _ack(0x03, mid))
+        clock.advance(30)
+        await svc._outbox_tick()
+        check("sent DM with no 0x03 after 30 s is unconfirmed",
+              svc._outbox[x]["state"] == "unconfirmed" and svc._outbox[y]["state"] == "unconfirmed")
+        clock.advance(ttl)  # more than 24 h after sent_at
+        await svc._outbox_tick()
+        check("unconfirmed record becomes failed once 24 h have passed since sent_at",
+              svc._outbox[x]["state"] == "failed" and svc._outbox[y]["state"] == "failed")
+        _phone_to_service(svc, phone, _ack(0x03, y))
+        check("late 0x03 upgrades a failed-after-sent record to delivered",
+              svc._outbox[y]["state"] == "delivered")
+        _phone_to_service(svc, phone, _ack(0x02, y))
+        check("late 0x02 upgrades it again to read", svc._outbox[y]["state"] == "read")
+
+        # 201st record: the cap drops the oldest terminal record, which is failed X.
+        await svc.send_private_message(phone.peer_hex, "Z")
+        mine = [m for m, e in svc._outbox.items() if e["peer_id"] == phone.peer_hex]
+        check("201st DM prunes the failed record X", x not in svc._outbox)
+        check("cap holds at 200 after the prune", len(mine) == 200)
+
+        lines_before = len(svc.lines)
+        events_before = len(svc.dm_status_events)
+        _phone_to_service(svc, phone, _ack(0x03, x))
+        _phone_to_service(svc, phone, _ack(0x02, x))
+        await _aio.sleep(0)
+        check("late receipt for pruned X: no warning", len(svc.lines) == lines_before)
+        check("late receipt for pruned X: no state event", len(svc.dm_status_events) == events_before)
+        check("pruned X is not recreated", x not in svc._outbox)
+
+    _aio.run(run())
+
+
 if __name__ == "__main__":
     print("Running bitchat-cli protocol self-tests...\n")
     tests = [
@@ -746,6 +784,7 @@ if __name__ == "__main__":
         test_outbox_keeps_200_records_and_ignores_late_receipts,
         test_cap_never_drops_sending_records,
         test_unread_incoming_capped_at_500_per_peer,
+        test_unconfirmed_fails_after_24h_and_late_receipts_follow_the_rules,
     ]
     for test in tests:
         print(f"{test.__name__}:")

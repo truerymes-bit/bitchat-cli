@@ -33,7 +33,7 @@ async def _stub_run():
 
 def _make_app(nickname: str = "Tester"):
     state = ChatState(nickname=nickname)
-    app = BitchatApp(state)
+    app = BitchatApp(state, log=[].append)  # debug lines to a list, never the real log
     # No BLE hardware in tests.
     app.ble_service.run = _stub_run  # type: ignore[assignment]
     app.ble_service.send_public_message = AsyncMock()  # type: ignore[assignment]

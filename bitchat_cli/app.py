@@ -16,6 +16,7 @@ from textual.widgets import Input, Static, Tabs, Tab, ContentSwitcher
 
 from . import palette, theme
 from .ble_service import BLEService
+from .debuglog import dlog
 from .chat_state import ChatState
 from .cli import CLI
 from .events import AppEvent, EventBus, EventType, GENERAL
@@ -54,11 +55,11 @@ class BitchatApp(App):
         variables.update(palette.css_variables())
         return variables
 
-    def __init__(self, state: ChatState):
+    def __init__(self, state: ChatState, log=None):
         super().__init__()
         self.state = state
         self.event_bus = EventBus()
-        self.ble_service = BLEService(state, self._request_redraw)
+        self.ble_service = BLEService(state, self._request_redraw, log=log or dlog)
         self.cli = CLI(state)
         self.cli.ble_service = self.ble_service
         self.ble_service.dm_visible = self._dm_visible
