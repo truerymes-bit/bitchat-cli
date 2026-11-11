@@ -325,15 +325,14 @@ class RecordingBLEService(_ble.BLEService):
         super().__init__(state, lambda: None, clock=clock)
         self.sent = []    # (clock time, packet)
         self.lines = []   # (conv, line)
+        self.dm_status_events = []  # (conv, msg_id, state) from the service hook
+        self.dm_status_cb = lambda conv, msg_id, state: self.dm_status_events.append((conv, msg_id, state))
 
     async def _broadcast(self, packet):
         self.sent.append((self.clock(), packet))
 
     def _emit(self, line, conv=None, msg_id=None, is_self=False):
         self.lines.append((conv, line))
-
-    def _has_link(self):
-        return True
 
     def dm_packets(self):
         return [p for _, p in self.sent if p.type == _MT.NOISE_ENCRYPTED]
@@ -606,6 +605,121 @@ def test_read_receipts_once_per_unread_message():
     _aio.run(run())
 
 
+def _kick_logged(peer_hex):
+    """True if DM_HS_KICK for this peer prefix is in the debug log (peer ids are random per run)."""
+    from bitchat_cli.debuglog import LOG_PATH
+    with open(LOG_PATH, "rb") as f:
+        f.seek(0, 2)
+        f.seek(max(0, f.tell() - 262144))
+        tail = f.read().decode("utf-8", errors="replace")
+    return f"DM_HS_KICK: peer={peer_hex[:8]}" in tail
+
+
+def test_no_handshake_until_peer_is_visible():
+    clock = FakeClock()
+
+    async def run():
+        svc, phone = _make(clock)
+        svc.state.peer_nicknames.pop(phone.peer_hex)  # key known, peer not visible
+        msg_id = await svc.send_private_message(phone.peer_hex, "queued")
+        for _ in range(120):  # two minutes of 1 s ticks
+            await svc._outbox_tick()
+            await _aio.sleep(0)
+            clock.advance(1)
+        check("peer not in peer_nicknames: no handshake across 120 ticks",
+              svc.handshake_packets() == [])
+        check("its DM stays sending", svc._outbox[msg_id]["state"] == "sending")
+        svc.state.set_peer(phone.peer_hex, "bob")  # peer becomes visible
+        before = len(svc.handshake_packets())
+        await svc._outbox_tick()
+        await _aio.sleep(0)
+        check("first tick after the peer appears (past backoff) starts a handshake",
+              len(svc.handshake_packets()) == before + 1)
+        check("that kick is logged as DM_HS_KICK", _kick_logged(phone.peer_hex))
+
+    _aio.run(run())
+
+
+def test_outbox_keeps_200_records_and_ignores_late_receipts():
+    clock = FakeClock()
+
+    async def run():
+        svc, phone = _make(clock)
+        await _establish(svc, phone)
+        ids = []
+        for i in range(250):
+            mid = await svc.send_private_message(phone.peer_hex, f"m{i}")
+            ids.append(mid)
+            _phone_to_service(svc, phone, _ack(0x03, mid))  # delivered before the next send
+        mine = [m for m, e in svc._outbox.items() if e["peer_id"] == phone.peer_hex]
+        check("250 acked DMs leave 200 records", len(mine) == 200)
+        check("the 200 kept are the most recent", mine == ids[-200:])
+        check("oldest record dropped", ids[0] not in svc._outbox)
+
+        lines_before = len(svc.lines)
+        events_before = len(svc.dm_status_events)
+        _phone_to_service(svc, phone, _ack(0x03, ids[0]))
+        _phone_to_service(svc, phone, _ack(0x02, ids[0]))
+        await _aio.sleep(0)
+        check("late ack/receipt for a dropped id: no warning", len(svc.lines) == lines_before)
+        check("late ack/receipt for a dropped id: no state event",
+              len(svc.dm_status_events) == events_before)
+        check("late receipt does not recreate the record", ids[0] not in svc._outbox)
+
+    _aio.run(run())
+
+
+def test_cap_never_drops_sending_records():
+    clock = FakeClock()
+
+    async def run():
+        svc, phone = _make(clock)
+        await _establish(svc, phone)
+        first = None
+        for i in range(199):
+            mid = await svc.send_private_message(phone.peer_hex, f"d{i}")
+            first = first or mid
+            _phone_to_service(svc, phone, _ack(0x03, mid))
+        # Session gone: the next two DMs stay sending. 199 delivered + 2 sending = 201.
+        saved = svc._noise_sessions.pop(phone.peer_hex)
+        stuck = await svc.send_private_message(phone.peer_hex, "stuck")
+        last = await svc.send_private_message(phone.peer_hex, "last")
+        mine = [m for m, e in svc._outbox.items() if e["peer_id"] == phone.peer_hex]
+        check("cap holds at 200", len(mine) == 200)
+        check("oldest delivered record dropped instead", first not in svc._outbox)
+        check("sending DM is never dropped by the cap",
+              stuck in svc._outbox and svc._outbox[stuck]["state"] == "sending")
+        check("second sending DM also kept",
+              last in svc._outbox and svc._outbox[last]["state"] == "sending")
+        svc._noise_sessions[phone.peer_hex] = saved
+        await svc._outbox_tick()
+        await _aio.sleep(0)
+        check("with the session back, the queued DMs flush",
+              svc._outbox[stuck]["state"] == "sent" and svc._outbox[last]["state"] == "sent")
+
+    _aio.run(run())
+
+
+def test_unread_incoming_capped_at_500_per_peer():
+    clock = FakeClock()
+
+    async def run():
+        svc, phone = _make(clock)
+        await _establish(svc, phone)
+        for i in range(600):
+            mid = f"IN-{i:04d}"
+            tlv = bytes([0x00, len(mid)]) + mid.encode() + bytes([0x01, 2]) + b"hi"
+            _phone_to_service(svc, phone, bytes([0x01]) + tlv)
+        for _ in range(3):
+            await _aio.sleep(0)
+        unread = svc._unread_incoming[phone.peer_hex]
+        check("600 incoming DMs leave 500 unread ids", len(unread) == 500)
+        check("kept ids are the newest 500",
+              unread == [f"IN-{i:04d}" for i in range(100, 600)])
+
+    _aio.run(run())
+
+
 if __name__ == "__main__":
     print("Running bitchat-cli protocol self-tests...\n")
     tests = [
@@ -628,6 +742,10 @@ if __name__ == "__main__":
         test_queue_expiry_marks_failed_and_sends_nothing,
         test_incoming_dm_gets_real_delivery_ack,
         test_read_receipts_once_per_unread_message,
+        test_no_handshake_until_peer_is_visible,
+        test_outbox_keeps_200_records_and_ignores_late_receipts,
+        test_cap_never_drops_sending_records,
+        test_unread_incoming_capped_at_500_per_peer,
     ]
     for test in tests:
         print(f"{test.__name__}:")

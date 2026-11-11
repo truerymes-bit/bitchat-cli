@@ -99,6 +99,10 @@ OUTBOX_MAX_PER_PEER = 100                    # Router.OUTBOX_MAX_PER_PEER
 HANDSHAKE_RETRY_BACKOFF_MS = (5_000, 15_000, 30_000, 60_000)  # Router.HANDSHAKE_RETRY_BACKOFF_MS
 # Not from Android (spec): a sent DM with no 0x03 after this long shows "unconfirmed".
 DM_UNCONFIRMED_AFTER_S = 30.0
+# Caps: delivery records kept per peer (terminal ones dropped first); unread incoming ids per peer.
+OUTBOX_RECORDS_PER_PEER = 200
+UNREAD_INCOMING_PER_PEER = 500
+TERMINAL_DM_STATES = ("delivered", "read", "failed")
 # Delivery states only move upward (never downgrade). Android NoisePayloadType:
 # READ_RECEIPT=0x02, DELIVERED=0x03.
 DM_STATE_RANK = {"sending": 0, "failed": 0, "sent": 1, "unconfirmed": 1, "delivered": 2, "read": 3}
@@ -695,6 +699,8 @@ class BLEService:
                     unread = self._unread_incoming.setdefault(peer_id, [])
                     if msg_id not in unread:
                         unread.append(msg_id)
+                    if len(unread) > UNREAD_INCOMING_PER_PEER:
+                        del unread[: len(unread) - UNREAD_INCOMING_PER_PEER]  # drop oldest
                     # PrivateChatManager model: a DM arriving in the visible, focused tab is read at once.
                     if self.dm_visible(peer_id):
                         asyncio.ensure_future(self.read_receipts_for_peer(peer_id))
@@ -1206,11 +1212,6 @@ class BLEService:
         else:
             self._unread_incoming.pop(peer_id_hex, None)
 
-    def _has_link(self) -> bool:
-        """True when any BLE link is up. Android gates handshake kicks on isConnected."""
-        return bool(self.clients) or bool(
-            self._peripheral is not None and self._peripheral.connected_addresses)
-
     def _dm_session_ready(self, peer_id_hex: str) -> bool:
         """Finished Noise session that is not older than DM_SESSION_MAX_AGE (service clock)."""
         s = self._noise_sessions.get(peer_id_hex)
@@ -1233,7 +1234,26 @@ class BLEService:
             e["state"] = new
             dlog(f"DM_STATE: msg_id={msg_id[:8]} {old}->{new}")
             self.dm_status_cb(e["peer_id"], msg_id, new)
+            if new in TERMINAL_DM_STATES:
+                self._prune_outbox(e["peer_id"])
         return ok
+
+    def _prune_outbox(self, peer_id_hex: str) -> None:
+        """Keep at most OUTBOX_RECORDS_PER_PEER records for a peer.
+
+        Drops the oldest terminal records (delivered, read, failed) first. Records in
+        sending, sent or unconfirmed are never dropped, so the cap can be exceeded
+        while they are open. A late receipt for a dropped id is ignored by
+        _set_dm_state (no entry, no event, no warning).
+        """
+        mine = [m for m, e in self._outbox.items() if e["peer_id"] == peer_id_hex]
+        excess = len(mine) - OUTBOX_RECORDS_PER_PEER
+        for m in mine:  # dict order = enqueue order, oldest first
+            if excess <= 0:
+                break
+            if self._outbox[m]["state"] in TERMINAL_DM_STATES:
+                del self._outbox[m]
+                excess -= 1
 
     async def _transmit_dm(self, peer_id_hex: str, content: str, msg_id: str) -> bool:
         """Encrypt and broadcast one NOISE_ENCRYPTED DM. False if no ready session."""
@@ -1297,8 +1317,8 @@ class BLEService:
             if self._dm_session_ready(peer):
                 await self._flush_peer(peer, now)
                 continue
-            if not self._has_link():
-                continue
+            if peer not in self.state.peer_nicknames:
+                continue  # peer not visible yet: no handshake
             pub = self.state.get_peer_noise_key(peer)
             if pub is None:
                 continue
@@ -1339,6 +1359,7 @@ class BLEService:
         now = self.clock()
         self._outbox[msg_id] = {"peer_id": peer_id_hex, "content": content,
                                 "enqueued_at": now, "sent_at": None, "state": "sending"}
+        self._prune_outbox(peer_id_hex)
         self._chat(self.state.nickname, content, is_self=True, conv=peer_id_hex, msg_id=msg_id)
         if self._dm_session_ready(peer_id_hex):
             await self._flush_peer(peer_id_hex, now)
