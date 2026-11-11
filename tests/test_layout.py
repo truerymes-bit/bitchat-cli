@@ -16,6 +16,7 @@ from rich.color import Color
 from bitchat_cli.app import BitchatApp
 from bitchat_cli.events import AppEvent, EventType
 from bitchat_cli import palette
+from bitchat_cli import theme as theme_mod
 from bitchat_cli.cli import COMMANDS
 from bitchat_cli.events import GENERAL
 from bitchat_cli.widgets import ConversationView
@@ -195,12 +196,22 @@ async def _modal_scenario(size: tuple[int, int]) -> None:
         check(f"{size} F1/F2 changed no conversation view",
               {k: len(v[0]._entries) for k, v in app.conversations.items()} == entry_counts)
 
-        # ---- (g) typed slash commands still write to the chat
+        # ---- (g) typed slash commands open the modals and write nothing
+        counts = {k: len(v[0]._entries) for k, v in app.conversations.items()}
         await _submit(pilot, app, "/help")
-        # "/help" writes to the current conversation, as before the modals existed.
-        current = app.conversations[app._current_conv][0]
-        check(f"{size} /help still writes to the chat",
-              any("Commands:" in t for t in _line_texts(current)))
+        check(f"{size} /help opens the help modal", isinstance(app.screen, HelpScreen),
+              type(app.screen).__name__)
+        await pilot.press("escape"); await pilot.pause(); await asyncio.sleep(0.1)
+        await _submit(pilot, app, "/peers")
+        check(f"{size} /peers opens the peers modal", isinstance(app.screen, PeersScreen),
+              type(app.screen).__name__)
+        await pilot.press("escape"); await pilot.pause(); await asyncio.sleep(0.1)
+        await _submit(pilot, app, "/w")
+        check(f"{size} /w opens the peers modal", isinstance(app.screen, PeersScreen),
+              type(app.screen).__name__)
+        await pilot.press("escape"); await pilot.pause(); await asyncio.sleep(0.1)
+        check(f"{size} slash commands wrote no conversation line",
+              {k: len(v[0]._entries) for k, v in app.conversations.items()} == counts)
 
 
 async def _glyph_scenario(size: tuple[int, int]) -> None:
@@ -394,12 +405,107 @@ async def _scenario(size: tuple[int, int], label: str) -> None:
         print(f"saved {screenshot}")
 
 
+async def _theme_scenario(size: tuple[int, int]) -> None:
+    """(h) "bitchat" is the default theme; switching themes restyles the UI."""
+    app, state = _make_app()
+    _add_peer(state, FAKE_PEER, "bob")
+    async with app.run_test(size=size) as pilot:
+        await pilot.pause()
+        await asyncio.sleep(0.3)
+        check(f"{size} default theme is bitchat", app.theme == "bitchat", app.theme)
+
+        def snap() -> dict:
+            hdr = app.query_one("#app-header")
+            tabs = app.query_one("#conv-tabs")
+            return {
+                "header": str(hdr.styles.border),
+                "tab": str(tabs.active_tab.styles.color),
+                "input": str(app.query_one("#input").styles.color),
+                "footer": str(app.query_one("#footer").styles.background),
+            }
+
+        def segment_colour(view, needle: str):
+            """Truecolour of the first segment containing `needle`, else None."""
+            for ln in view.lines:
+                for seg in ln:
+                    if needle in seg.text and seg.style is not None and seg.style.color is not None:
+                        return seg.style.color.get_truecolor()
+            return None
+
+        # --- General chat line, checked while the General tab is active
+        app.event_bus.publish_nowait(AppEvent(
+            EventType.OUTPUT, theme_mod.chat("bob", "theme probe", is_self=False), GENERAL))
+        await pilot.pause()
+        await asyncio.sleep(0.2)
+
+        general = app.conversations[GENERAL][0]
+        base = snap()
+        base_line = segment_colour(general, "bob")
+        check(f"{size} bitchat chat line uses the palette accent",
+              base_line == Color.parse(palette.PINK).get_truecolor(), base_line)
+        app.save_screenshot(f"screenshot_theme_bitchat_{size[0]}x{size[1]}.svg")
+
+        for name in ("nord", "textual-light"):
+            app.theme = name
+            await pilot.pause()
+            await asyncio.sleep(0.4)
+            s = snap()
+            check(f"{size} {name} restyles the header", s["header"] != base["header"], s)
+            check(f"{size} {name} restyles the active tab", s["tab"] != base["tab"], s)
+            check(f"{size} {name} restyles the input", s["input"] != base["input"], s)
+            check(f"{size} {name} restyles the footer", s["footer"] != base["footer"], s)
+            check(f"{size} {name} restyles the chat line",
+                  segment_colour(general, "bob") != base_line, segment_colour(general, "bob"))
+            if name == "nord":
+                app.save_screenshot(f"screenshot_theme_nord_{size[0]}x{size[1]}.svg")
+
+        app.theme = "bitchat"
+        await pilot.pause()
+        await asyncio.sleep(0.4)
+        back = snap()
+        check(f"{size} bitchat restores the header", back["header"] == base["header"], back)
+        check(f"{size} bitchat restores the active tab", back["tab"] == base["tab"], back)
+        check(f"{size} bitchat restores the input", back["input"] == base["input"], back)
+        check(f"{size} bitchat restores the footer", back["footer"] == base["footer"], back)
+        check(f"{size} bitchat restores the chat line",
+              segment_colour(general, "bob") == base_line, segment_colour(general, "bob"))
+
+        # --- DM tick glyph, checked while the DM tab is active
+        app.open_dm(FAKE_PEER)
+        mid = "MSG-THEME-1"
+        app.event_bus.publish_nowait(AppEvent(
+            EventType.OUTPUT, "theme dm", FAKE_PEER, msg_id=mid, is_self=True))
+        app.event_bus.publish_nowait(AppEvent(
+            EventType.DM_STATUS, {"conv": FAKE_PEER, "msg_id": mid, "state": "read"}))
+        await pilot.pause()
+        await asyncio.sleep(0.2)
+
+        dm = app.conversations[FAKE_PEER][0]
+        base_tick = segment_colour(dm, "\u2713")
+        check(f"{size} bitchat tick uses the palette primary",
+              base_tick == Color.parse(palette.EMERALD).get_truecolor(), base_tick)
+
+        for name in ("nord", "textual-light"):
+            app.theme = name
+            await pilot.pause()
+            await asyncio.sleep(0.4)
+            check(f"{size} {name} restyles the tick glyph",
+                  segment_colour(dm, "\u2713") != base_tick, segment_colour(dm, "\u2713"))
+
+        app.theme = "bitchat"
+        await pilot.pause()
+        await asyncio.sleep(0.4)
+        check(f"{size} bitchat restores the tick glyph",
+              segment_colour(dm, "\u2713") == base_tick, segment_colour(dm, "\u2713"))
+
+
 async def test_tabs_and_routing() -> None:
     await _scenario((80, 24), "80x24")
     await _scenario((120, 40), "120x40")
     await _glyph_scenario((80, 24))
     await _modal_scenario((80, 24))
     await _modal_scenario((120, 40))
+    await _theme_scenario((80, 24))
     print("All tests passed!")
 
 

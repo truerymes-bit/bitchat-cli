@@ -24,6 +24,7 @@ class SettingsScreen(ModalScreen):
         self._peer_id = peer_id
 
     def compose(self) -> ComposeResult:
+        c = palette.colors()
         with Vertical(id="settings-box"):
             yield Static("Settings", id="settings-title")
             yield Static("Nickname", id="settings-label")
@@ -31,8 +32,8 @@ class SettingsScreen(ModalScreen):
             yield Static(f"Your ID: <{self._peer_id}>", id="settings-id")
             yield Static(
                 Text.assemble(
-                    ("[Enter]", f"bold {palette.EMERALD}"), (" Apply   ", palette.MUTED),
-                    ("[Esc]", f"bold {palette.EMERALD}"), (" Cancel", palette.MUTED),
+                    ("[Enter]", f"bold {c['emerald']}"), (" Apply   ", c["muted"]),
+                    ("[Esc]", f"bold {c['emerald']}"), (" Cancel", c["muted"]),
                 ),
                 id="settings-hint",
             )
@@ -140,27 +141,8 @@ class PeersScreen(ModalScreen):
         self._show_detail()
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
-        # OptionList consumes Enter, so the screen binding never fires; use its message.
+        # OptionList consumes Enter, so the screen's `enter` binding never fires.
         self._show_detail()
-        self.action_open_dm()
-
-    def on_option_list_option_selected(self, event) -> None:
-        # OptionList consumes Enter and emits this instead of the `enter` binding.
-        self._open_highlighted()
-
-    def _open_highlighted(self) -> None:
-        row = self._highlighted()
-        if row is None:
-            return
-        pid = row[0]
-        if pid == self._state.my_peer_id_hex or pid not in self._state.peer_info:
-            self._notify(f"{self._state.nickname_for(pid)} cannot be messaged yet",
-                         severity="warning")
-            return
-        self._open_dm(pid, switch=True)
-        self.dismiss()
-
-    def on_option_list_option_selected(self, event) -> None:
         self.action_open_dm()
 
     def action_open_dm(self):

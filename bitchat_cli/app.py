@@ -12,6 +12,7 @@ from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.containers import Vertical
 from textual.binding import Binding
+from textual.theme import Theme
 from textual.widgets import Input, Static, Tabs, Tab, ContentSwitcher
 
 from . import palette, theme
@@ -27,6 +28,32 @@ from .widgets import (
     ConversationView,
     InputPanel,
     RoomHeader,
+)
+
+
+# The bitchat look expressed as a Textual theme. primary/secondary/accent/etc.
+# drive both Textual's own widgets and the $bc-* variables (via palette), so
+# Ctrl+P > Change theme restyles the whole UI.
+BITCHAT_THEME = Theme(
+    name="bitchat",
+    primary=palette.EMERALD,
+    secondary=palette.CYAN,
+    accent=palette.PINK,
+    foreground=palette.TEXT,
+    background=palette.BG,
+    surface=palette.PANEL,
+    panel=palette.PANEL,
+    success=palette.GREEN,
+    warning=palette.AMBER,
+    error=palette.RED,
+    dark=True,
+    variables={
+        # Pin the shades the palette uses, so the bitchat theme reproduces the
+        # pre-theme look exactly. Other themes fall back to Textual's shades.
+        "panel-lighten-1": palette.PANEL_ALT,
+        "panel-lighten-2": palette.BAR,
+        "text-muted": palette.MUTED,
+    },
 )
 
 
@@ -57,6 +84,8 @@ class BitchatApp(App):
 
     def __init__(self, state: ChatState, log=None):
         super().__init__()
+        self.register_theme(BITCHAT_THEME)
+        self.theme = "bitchat"
         self.state = state
         self.event_bus = EventBus()
         self.ble_service = BLEService(state, self._request_redraw, log=log or dlog)
@@ -71,6 +100,9 @@ class BitchatApp(App):
         self.cli.redraw_prompt = self._request_redraw
         self.cli.clear_screen = self.action_clear_chat
         self.cli.open_dm = self.open_dm
+        # F1/F2 modals: the CLI routes /help and /peers through these hooks.
+        self.cli.show_help = self._show_help_screen
+        self.cli.show_peers = self._show_peers_screen
         self.ble_service._emit = lambda line, conv=None, msg_id=None, is_self=False: self.event_bus.publish_nowait(
             AppEvent(EventType.OUTPUT, line, conv, msg_id=msg_id, is_self=is_self)
         )
@@ -289,15 +321,37 @@ class BitchatApp(App):
         self._switch_conv(GENERAL)
         self._refresh_status()
 
-    async def action_show_help(self) -> None:
+    def _show_help_screen(self) -> None:
         self.push_screen(HelpScreen(self.BINDINGS, COMMANDS))
 
-    async def action_show_peers(self) -> None:
+    def _show_peers_screen(self) -> None:
         self.push_screen(PeersScreen(
             self.state, self.ble_service,
             open_dm=lambda pid, switch=True: self.open_dm(pid, switch=switch),
             notify=self.notify,
         ))
+
+    async def action_show_help(self) -> None:
+        self._show_help_screen()
+
+    async def action_show_peers(self) -> None:
+        self._show_peers_screen()
+
+    def _watch_theme(self, theme_name: str) -> None:
+        """Re-derive the palette colours from the newly active theme.
+
+        Runs before Textual refreshes the CSS so $bc-* pick up the new theme.
+        """
+        current = self.current_theme
+        if current is not None:
+            variables = current.to_color_system().generate()
+            variables.update(current.variables or {})
+            palette.set_theme_colors(variables)
+        super()._watch_theme(theme_name)
+        # Re-colour stored chat lines with the new theme.
+        for view, _ in getattr(self, "conversations", {}).values():
+            if view.is_mounted:
+                view.rerender()
 
     def action_clear_chat(self) -> None:
         # Display only: ChatState.messages and all network state are untouched.
@@ -365,18 +419,19 @@ class BitchatApp(App):
         except Exception:
             return
         st = self.state
+        c = palette.colors()
         # Link state: a dot plus one word (Connected / Searching / Offline).
         # Use the existing state: ble_service._running and state.connected_addresses
         # / direct_peers. Connected means at least one connected peer.
         if self.ble_service._running:
             if st.connected_addresses or st.direct_peers:
-                col = palette.EMERALD
+                col = c["emerald"]
                 label = "Connected"
             else:
-                col = palette.MUTED
+                col = c["muted"]
                 label = "Searching"
         else:
-            col = palette.RED
+            col = c["red"]
             label = "Offline"
         header.update_link("●", col, label, col)
         self._update_room_header()

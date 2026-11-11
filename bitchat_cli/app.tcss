@@ -35,6 +35,11 @@ Screen {
     color: $bc-muted;
 }
 
+/* One space between the dot and the word: "● Connected". */
+#link-dot {
+    padding-right: 1;
+}
+
 #conv-tabs {
     height: 2;
     border: none;

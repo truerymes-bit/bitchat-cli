@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from rich.text import Text
+from rich.color import Color
+from rich.style import Style
+from rich.text import Span, Text
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.widgets import Input, RichLog, Static, Tab, Tabs
@@ -61,15 +63,47 @@ class RoomHeader(Horizontal):
 
 
 def _status_glyph(state):
-    """Tick glyph and colour for an outgoing DM state (None = no glyph)."""
+    """Tick glyph and colour for an outgoing DM state (None = no glyph).
+
+    Colours come from the active theme (palette.colors()), so the ticks restyle
+    with Ctrl+P > Change theme.
+    """
+    c = palette.colors()
     return {
-        "sending": ("...", palette.MUTED),
-        "sent": ("\u2713", palette.MUTED),
-        "delivered": ("\u2713\u2713", palette.MUTED),
-        "read": ("\u2713\u2713", palette.EMERALD),
-        "failed": ("!", palette.RED),
-        "unconfirmed": ("!", palette.RED),
+        "sending": ("...", c["muted"]),
+        "sent": ("\u2713", c["muted"]),
+        "delivered": ("\u2713\u2713", c["muted"]),
+        "read": ("\u2713\u2713", c["emerald"]),
+        "failed": ("!", c["red"]),
+        "unconfirmed": ("!", c["red"]),
     }.get(state)
+
+
+def _recolor(text: Text, mapping: dict) -> Text:
+    """Copy a Rich Text, replacing default-palette colours with the active ones.
+
+    Chat lines are stored as ANSI strings built from the default palette, so a
+    theme switch re-colours existing lines by mapping each default colour to
+    its counterpart in the active theme.
+    """
+    if not mapping:
+        return text
+    out = text.copy()
+    out.spans = [
+        Span(span.start, span.end, _mapped_style(span.style, mapping))
+        for span in text.spans
+    ]
+    return out
+
+
+def _mapped_style(style, mapping: dict):
+    if style is None or getattr(style, "color", None) is None:
+        return style
+    rgb = style.color.get_truecolor()
+    if rgb not in mapping:
+        return style
+    return Style(bold=style.bold, italic=style.italic, underline=style.underline,
+                 color=Color.parse(mapping[rgb]))
 
 
 class ConversationView(RichLog):
@@ -135,11 +169,16 @@ class ConversationView(RichLog):
 
     def _render(self, entry: dict) -> Text:
         text = Text.from_ansi(str(entry["line"]))
+        text = _recolor(text, palette.recolor_map())
         glyph = _status_glyph(entry["state"]) if entry["is_self"] else None
         if glyph is not None:
             text.append("  ")
             text.append(glyph[0], style=glyph[1])
         return text
+
+    def rerender(self) -> None:
+        """Re-draw every entry with the current theme colours."""
+        self._rerender()
 
     def _rerender(self) -> None:
         self._queued.clear()
@@ -150,9 +189,10 @@ class ConversationView(RichLog):
 
 class InputPanel(Horizontal):
     def compose(self) -> ComposeResult:
+        c = palette.colors()
         yield Static(">", id="input-prompt")
         yield Input(placeholder="Type a message...", id="input")
-        hint = Text.assemble(("[Enter]", f"bold {palette.EMERALD}"), (" Send", palette.MUTED))
+        hint = Text.assemble(("[Enter]", f"bold {c['emerald']}"), (" Send", c["muted"]))
         yield Static(hint, id="input-hint")
 
 
@@ -169,7 +209,8 @@ class KeyHint(Horizontal):
         self._label = label
 
     def compose(self) -> ComposeResult:
-        yield KeyCap(Text(self._key, style=f"bold {palette.EMERALD}"), classes="keycap")
+        c = palette.colors()
+        yield KeyCap(Text(self._key, style=f"bold {c['emerald']}"), classes="keycap")
         yield Static(self._label, classes="keylabel")
 
 

@@ -40,6 +40,10 @@ class CLI:
         self._start_time = time.monotonic()
         # Overridden by the TUI so /dm can open a conversation tab.
         self.open_dm = lambda peer_id: None
+        # Overridden by the TUI to open the F1/F2 modals. While None (headless or
+        # plain stdout), /help and /peers keep their text output.
+        self.show_help = None
+        self.show_peers = None
 
     def redraw_prompt(self):
         pass
@@ -60,6 +64,9 @@ class CLI:
         cmd = parts[0].lower()
 
         if cmd == "/w":
+            if self.show_peers is not None:
+                self.show_peers()
+                return
             if not self.state.peer_nicknames:
                 self._out(theme.system("No peers yet — still scanning / waiting for announces…"))
             else:
@@ -69,6 +76,9 @@ class CLI:
                     name = theme.sgr(nick, theme.BOLD, theme.REMOTE)
                     self._out(f"  {name} {theme.sgr(peer_id, theme.PATH)}")
         elif cmd == "/peers":
+            if self.show_peers is not None:
+                self.show_peers()
+                return
             if not getattr(self.state, 'peer_info', None):
                 self._out(theme.system("No verified peers yet — waiting for announces…"))
             else:
@@ -230,6 +240,9 @@ class CLI:
         elif cmd == "/clear":
             self.clear_screen()
         elif cmd == "/help":
+            if self.show_help is not None:
+                self.show_help()
+                return
             self._out(theme.system("Commands:"))
             for name, desc in COMMANDS:
                 cmd_col = theme.sgr(name.ljust(14), theme.BOLD, theme.BRAND)
