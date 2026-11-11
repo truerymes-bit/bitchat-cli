@@ -144,6 +144,72 @@ KeyHint {
     height: 1;
 }
 
+/* ---- Peers modal (F2) ------------------------------------------------ */
+PeersScreen {
+    align: center middle;
+    background: $bc-bg 60%;
+}
+
+#peers-box {
+    width: 64;
+    max-height: 20;
+    border: solid $bc-emerald;
+    background: $bc-panel;
+    padding: 1 2;
+}
+
+#peers-title {
+    color: $bc-emerald;
+    text-style: bold;
+}
+
+#peers-list {
+    height: auto;
+    max-height: 12;
+    border: none;
+    background: $bc-panel;
+}
+
+#peers-detail {
+    color: $bc-muted;
+    height: 1;
+    margin-top: 1;
+}
+
+/* ---- Help modal (F1) ------------------------------------------------- */
+HelpScreen {
+    align: center middle;
+    background: $bc-bg 60%;
+}
+
+#help-box {
+    width: 64;
+    max-height: 20;
+    border: solid $bc-emerald;
+    background: $bc-panel;
+    padding: 1 2;
+}
+
+#help-title {
+    color: $bc-emerald;
+    text-style: bold;
+}
+
+#help-keys-title, #help-cmds-title {
+    color: $bc-emerald;
+    text-style: bold;
+    margin-top: 1;
+}
+
+.help-key, .help-cmd {
+    color: $bc-text;
+}
+
+#help-hint {
+    color: $bc-muted;
+    margin-top: 1;
+}
+
 /* ---- Settings modal -------------------------------------------------- */
 SettingsScreen {
     align: center middle;

@@ -9,18 +9,25 @@ from unittest.mock import AsyncMock
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from textual.widgets import Input, Tab, Tabs
+from textual.widgets import Input, OptionList, Static, Tab, Tabs
 
 from rich.color import Color
 
 from bitchat_cli.app import BitchatApp
 from bitchat_cli.events import AppEvent, EventType
 from bitchat_cli import palette
+from bitchat_cli.cli import COMMANDS
+from bitchat_cli.events import GENERAL
 from bitchat_cli.widgets import ConversationView
 from bitchat_cli.chat_state import ChatState
 from bitchat_cli.screens import SettingsScreen
 
 FAKE_PEER = "a" * 16
+
+
+def check(label, condition, detail=None):
+    if not condition:
+        raise AssertionError(f"{label}" + (f" -- {detail}" if detail is not None else ""))
 FAKE_PEER2 = "b" * 16
 
 
@@ -33,6 +40,7 @@ async def _stub_run():
 
 def _make_app(nickname: str = "Tester"):
     state = ChatState(nickname=nickname)
+    state.verified_peers = set()  # tests are independent of ~/.bitchat/verified_peers.json
     app = BitchatApp(state, log=[].append)  # debug lines to a list, never the real log
     # No BLE hardware in tests.
     app.ble_service.run = _stub_run  # type: ignore[assignment]
@@ -67,6 +75,132 @@ async def _submit(pilot, app: BitchatApp, text: str) -> None:
 
 def _line_texts(view) -> list[str]:
     return [strip.text for strip in view.lines]
+
+
+def _option_rows(modal):
+    lst = modal.query_one("#peers-list", OptionList)
+    return [(o.id, o.prompt.plain if hasattr(o.prompt, "plain") else str(o.prompt))
+            for o in lst.options]
+
+
+def _fake_session(svc, peer, finished=True):
+    class _S:
+        is_finished = finished
+        created_at = svc.clock() if hasattr(svc, "clock") else 0.0
+    svc._noise_sessions[peer] = _S()
+
+
+async def _modal_scenario(size: tuple[int, int]) -> None:
+    """F1/F2 modals: peers list, glyphs, Enter, verify toggle, help, no chat writes."""
+    app, state = _make_app()
+    from bitchat_cli.screens import PeersScreen, HelpScreen, VERIFIED_TICK, DM_LOCK
+    # bob: verified + session; carol: verified only; dave: session only; erin: neither
+    for pid, nick in ((FAKE_PEER, "bob"), (FAKE_PEER2, "carol")):
+        _add_peer(state, pid, nick)
+    dave, erin, nokey = "d" * 16, "e" * 16, "f" * 16
+    _add_peer(state, dave, "dave"); _add_peer(state, erin, "erin")
+    state.set_peer(nokey, "frank")  # nickname only, no Noise key
+    state.verify_peer(FAKE_PEER); state.verify_peer(FAKE_PEER2)
+    _fake_session(app.ble_service, FAKE_PEER)
+    _fake_session(app.ble_service, dave)
+
+    async with app.run_test(size=size) as pilot:
+        await pilot.pause(); await asyncio.sleep(0.1)
+
+        # ---- (a) F2 opens the modal; rows, order, glyphs
+        await pilot.press("f2"); await pilot.pause(); await asyncio.sleep(0.1)
+        assert isinstance(app.screen, PeersScreen), type(app.screen)
+        rows = _option_rows(app.screen)
+        check(f"{size} row count is peers + me", len(rows) == 6, len(rows))
+        check(f"{size} me row is first", rows[0][1].endswith("(you)"), rows[0])
+        check(f"{size} rows sorted by nickname",
+              [r[1] for r in rows[1:]] == ["✓ L bob", "✓   carol", "  L dave", "    erin", "    frank (no DM)"],
+              [r[1] for r in rows[1:]])
+        box = app.screen.query_one("#peers-box")
+        r = box.region
+        check(f"{size} peers modal inside screen",
+              r.width > 0 and r.height > 0 and r.right <= app.size.width and r.bottom <= app.size.height,
+              r)
+        app.save_screenshot(f"screenshot_peers_{size[0]}x{size[1]}.svg")
+
+        # ---- (b) Enter on a DM-able peer opens and activates the tab
+        before_tabs = app._open_keys()
+        lst = app.screen.query_one("#peers-list", OptionList)
+        lst.highlighted = next(i for i, (pid, _) in enumerate(_option_rows(app.screen)) if pid == FAKE_PEER)
+        await pilot.press("enter"); await pilot.pause(); await asyncio.sleep(0.1)
+        check(f"{size} Enter on bob closes the modal", not isinstance(app.screen, PeersScreen))
+        check(f"{size} bob tab added and active",
+              FAKE_PEER in app._open_keys() and app._current_conv == FAKE_PEER)
+
+        # Enter on "me" and on the no-DM peer: no tab, warning raised
+        await pilot.press("f2"); await pilot.pause(); await asyncio.sleep(0.1)
+        before = app._open_keys()
+        app.screen.query_one("#peers-list", OptionList).highlighted = 0
+        await pilot.press("enter"); await pilot.pause(); await asyncio.sleep(0.1)
+        check(f"{size} Enter on me adds no tab", app._open_keys() == before)
+        lst = app.screen.query_one("#peers-list", OptionList)
+        lst.highlighted = next(i for i, (pid, _) in enumerate(_option_rows(app.screen)) if pid == nokey)
+        await pilot.press("enter"); await pilot.pause(); await asyncio.sleep(0.1)
+        check(f"{size} Enter on no-DM peer adds no tab", app._open_keys() == before)
+        check(f"{size} warning notification raised",
+              len(app._notifications._notifications) > 0, app._notifications._notifications)
+
+        # ---- (c) v toggles verification
+        lst = app.screen.query_one("#peers-list", OptionList)
+        lst.highlighted = next(i for i, (pid, _) in enumerate(_option_rows(app.screen)) if pid == erin)
+        await pilot.press("v"); await pilot.pause(); await asyncio.sleep(0.1)
+        check(f"{size} v verifies the highlighted peer", state.is_verified(erin))
+        lst = app.screen.query_one("#peers-list", OptionList)
+        erin_row = dict(_option_rows(app.screen))[erin]
+        check(f"{size} verified row glyph shows the tick", erin_row.startswith(VERIFIED_TICK), erin_row)
+        await pilot.press("v"); await pilot.pause(); await asyncio.sleep(0.1)
+        check(f"{size} v again un-verifies", not state.is_verified(erin))
+
+        # ---- (d) a peer joining while the modal is open appears
+        late = "9" * 16
+        _add_peer(state, late, "zoe")
+        app._refresh_peers_screen()
+        await pilot.pause(); await asyncio.sleep(0.1)
+        check(f"{size} peer joining while open appears",
+              late in dict(_option_rows(app.screen)))
+        await pilot.press("escape"); await pilot.pause(); await asyncio.sleep(0.1)
+        check(f"{size} Esc closes the peers modal", not isinstance(app.screen, PeersScreen))
+
+        # ---- (e) DM tab label and room header status
+        app.open_dm(FAKE_PEER); await pilot.pause(); await asyncio.sleep(0.1)
+        label = app.query_one(f"#tab-{FAKE_PEER}", Tab).label_text
+        check(f"{size} DM tab label shows lock and tick",
+              label.startswith(VERIFIED_TICK + DM_LOCK), label)
+        check(f"{size} room header shows verified",
+              app.query_one("#room-online").render() == "@bob · online · verified",
+              app.query_one("#room-online").render())
+
+        # ---- (f) F1 opens help with every key and command; Esc closes
+        entry_counts = {k: len(v[0]._entries) for k, v in app.conversations.items()}
+        await pilot.press("f1"); await pilot.pause(); await asyncio.sleep(0.1)
+        assert isinstance(app.screen, HelpScreen), type(app.screen)
+        help_text = "".join(str(w.render()) for w in app.screen.query(Static))
+        check(f"{size} help has every binding key",
+              all(b.key in help_text for b in app.BINDINGS if b.show), help_text[:80])
+        check(f"{size} help has every command",
+              all(name in help_text for name, _ in COMMANDS), help_text[:80])
+        hbox = app.screen.query_one("#help-box")
+        hr = hbox.region
+        check(f"{size} help modal inside screen",
+              hr.width > 0 and hr.height > 0 and hr.right <= app.size.width and hr.bottom <= app.size.height,
+              hr)
+        app.save_screenshot(f"screenshot_help_{size[0]}x{size[1]}.svg")
+        await pilot.press("escape"); await pilot.pause(); await asyncio.sleep(0.1)
+        check(f"{size} Esc closes help", not isinstance(app.screen, HelpScreen))
+        check(f"{size} F1/F2 changed no conversation view",
+              {k: len(v[0]._entries) for k, v in app.conversations.items()} == entry_counts)
+
+        # ---- (g) typed slash commands still write to the chat
+        await _submit(pilot, app, "/help")
+        # "/help" writes to the current conversation, as before the modals existed.
+        current = app.conversations[app._current_conv][0]
+        check(f"{size} /help still writes to the chat",
+              any("Commands:" in t for t in _line_texts(current)))
 
 
 async def _glyph_scenario(size: tuple[int, int]) -> None:
@@ -152,8 +286,8 @@ async def _scenario(size: tuple[int, int], label: str) -> None:
         await asyncio.sleep(0.1)
         assert app._open_keys() == ["general", FAKE_PEER], app._open_keys()
         assert app._current_conv == FAKE_PEER
-        assert app.query_one(f"#tab-{FAKE_PEER}", Tab).label_text == "@bob"
-        assert app.query_one("#room-online").render() == "@bob · online"
+        assert app.query_one(f"#tab-{FAKE_PEER}", Tab).label_text == "@bob", app.query_one(f"#tab-{FAKE_PEER}", Tab).label_text
+        assert app.query_one("#room-online").render() == "@bob · online · unverified"
 
         # Clicking a tab activates it (the Tabs.TabActivated path).
         await pilot.click("#tab-general")
@@ -264,8 +398,11 @@ async def test_tabs_and_routing() -> None:
     await _scenario((80, 24), "80x24")
     await _scenario((120, 40), "120x40")
     await _glyph_scenario((80, 24))
+    await _modal_scenario((80, 24))
+    await _modal_scenario((120, 40))
     print("All tests passed!")
 
 
 if __name__ == "__main__":
     asyncio.run(test_tabs_and_routing())
+

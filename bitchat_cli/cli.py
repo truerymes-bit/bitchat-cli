@@ -6,6 +6,29 @@ from . import __version__, theme
 from .ble_service import BLEService
 from .chat_state import ChatState
 
+# Slash-command table shared by /help and the TUI HelpScreen so they cannot drift.
+COMMANDS = (
+    ("/w", "List known peers."),
+    ("/peers", "List verified peers with keys."),
+    ("/dm <id|nick> [msg]", "Open a DM tab, optionally sending a message."),
+    ("/route <id> <msg>", "Send message via source-routed path."),
+    ("/verify <id>", "Mark a peer as verified (after comparing fingerprints)."),
+    ("/unverify <id>", "Remove verification from a peer."),
+    ("/name <nick>", "Change your nickname and re-announce."),
+    ("/send <path>", "Send an image, voice note, or file to peers."),
+    ("/sync", "Trigger a gossip sync with neighbors."),
+    ("/topology", "Show mesh topology graph."),
+    ("/clear", "Clear the screen."),
+    ("/help", "Show this help message."),
+)
+
+
+def noise_fingerprint(peer_id_hex: str, state) -> str:
+    """SHA-256 of the peer's Noise public key, hex. Same value /verify shows."""
+    import hashlib
+    info = state.peer_info.get(peer_id_hex) or {}
+    return hashlib.sha256(info.get("noise_public_key", b"")).hexdigest()
+
 
 class CLI:
     """Command-line interface and input loop."""
@@ -128,10 +151,8 @@ class CLI:
                 if target is None:
                     self._out(theme.warn(f"No peer matching '{peer_prefix}'"))
                 else:
-                    import hashlib
                     info = self.state.peer_info[target]
-                    noise_pub = info.get("noise_public_key", b"")
-                    fingerprint = hashlib.sha256(noise_pub).hexdigest()
+                    fingerprint = noise_fingerprint(target, self.state)
                     if self.state.verify_peer(target):
                         self._out(theme.system(f"Verified {info.get('nickname','?')} ({target[:8]})"))
                         self._out(theme.system(f"  fingerprint: {fingerprint}"))
@@ -210,20 +231,7 @@ class CLI:
             self.clear_screen()
         elif cmd == "/help":
             self._out(theme.system("Commands:"))
-            for name, desc in (
-                ("/w", "List known peers."),
-                ("/peers", "List verified peers with keys."),
-                ("/dm <id|nick> [msg]", "Open a DM tab, optionally sending a message."),
-                ("/route <id> <msg>", "Send message via source-routed path."),
-                ("/verify <id>", "Mark a peer as verified (after comparing fingerprints)."),
-                ("/unverify <id>", "Remove verification from a peer."),
-                ("/name <nick>", "Change your nickname and re-announce."),
-                ("/send <path>", "Send an image, voice note, or file to peers."),
-                ("/sync", "Trigger a gossip sync with neighbors."),
-                ("/topology", "Show mesh topology graph."),
-                ("/clear", "Clear the screen."),
-                ("/help", "Show this help message."),
-            ):
+            for name, desc in COMMANDS:
                 cmd_col = theme.sgr(name.ljust(14), theme.BOLD, theme.BRAND)
                 self._out(f"  {cmd_col} {theme.sgr(desc, theme.SYS)}")
         else:

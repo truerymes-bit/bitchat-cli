@@ -18,9 +18,9 @@ from . import palette, theme
 from .ble_service import BLEService
 from .debuglog import dlog
 from .chat_state import ChatState
-from .cli import CLI
+from .cli import CLI, COMMANDS
 from .events import AppEvent, EventBus, EventType, GENERAL
-from .screens import SettingsScreen
+from .screens import HelpScreen, PeersScreen, SettingsScreen, peer_glyphs
 from .widgets import (
     AppFooter,
     AppHeader,
@@ -64,6 +64,7 @@ class BitchatApp(App):
         self.cli.ble_service = self.ble_service
         self.ble_service.dm_visible = self._dm_visible
         self.ble_service.dm_status_cb = self._publish_dm_status
+        self._peers_screen = None
         self.cli._out = lambda line, conv=None: self.event_bus.publish_nowait(
             AppEvent(EventType.OUTPUT, line, conv)
         )
@@ -125,6 +126,8 @@ class BitchatApp(App):
         if unread is None:
             unread = entry[1]
         label = self._label_for(key)
+        if key != GENERAL:
+            label = self._dm_label(key)
         if unread:
             label = f"{label} ({unread})"
         try:
@@ -241,6 +244,18 @@ class BitchatApp(App):
             return
         self._switch_conv(key)
 
+    def _refresh_peers_screen(self) -> None:
+        """Keep an open F2 modal current as peers join or leave."""
+        screen = self.screen
+        if isinstance(screen, PeersScreen):
+            screen._load()
+
+    def _dm_label(self, key: str) -> str:
+        """@ nick plus lock/tick glyphs (DM tabs only)."""
+        label = self._label_for(key)
+        tick, lock = peer_glyphs(self.state, self.ble_service, key)
+        return f"{tick}{lock}{label}"
+
     def _update_room_header(self) -> None:
         try:
             room = self.query_one("#room-header", RoomHeader)
@@ -252,7 +267,8 @@ class BitchatApp(App):
             return
         nick = self.state.peer_nicknames.get(key)
         status = "online" if key in self.state.peer_nicknames else "offline"
-        room.update_room(f"@{nick}" if nick else f"@{key[:8]}", status)
+        verified = "verified" if self.state.is_verified(key) else "unverified"
+        room.update_room(f"@{nick}" if nick else f"@{key[:8]}", f"{status} · {verified}")
 
     def compose(self) -> ComposeResult:
         yield AppHeader(id="app-header")
@@ -274,10 +290,14 @@ class BitchatApp(App):
         self._refresh_status()
 
     async def action_show_help(self) -> None:
-        await self.cli.handle_command("/help")
+        self.push_screen(HelpScreen(self.BINDINGS, COMMANDS))
 
     async def action_show_peers(self) -> None:
-        await self.cli.handle_command("/peers")
+        self.push_screen(PeersScreen(
+            self.state, self.ble_service,
+            open_dm=lambda pid, switch=True: self.open_dm(pid, switch=switch),
+            notify=self.notify,
+        ))
 
     def action_clear_chat(self) -> None:
         # Display only: ChatState.messages and all network state are untouched.
@@ -361,6 +381,7 @@ class BitchatApp(App):
         header.update_link("●", col, label, col)
         self._update_room_header()
         self._refresh_tabs()
+        self._refresh_peers_screen()
 
     def _append_line(self, line: str, conv: str | None = None, msg_id: str | None = None,
                      is_self: bool = False) -> None:
