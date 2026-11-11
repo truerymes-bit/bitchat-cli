@@ -91,9 +91,17 @@ HS_RETRY_INTERVAL = 10.0      # seconds between background handshake retries
 HS_RETRY_MAX = 6              # max background retries per peer
 WRITE_RETRIES = 3             # retries for a BLE write that fails with 'In Progress'
 WRITE_RETRY_DELAY = 0.05      # seconds between those retries
-DM_ACK_TIMEOUT = 10.0         # seconds before retrying an unacked DM
-DM_ACK_MAX_RETRIES = 3        # max retries per DM
-DM_HANDSHAKE_TIMEOUT = 8.0    # seconds to wait for that handshake to finish
+# Outbox constants: values from bitchat-android
+# app/src/main/java/com/bitchat/android/util/AppConstants.kt, object Router.
+OUTBOX_TICK_MS = 2_000                       # Router.OUTBOX_TICK_MS
+OUTBOX_MESSAGE_TTL_MS = 86_400_000           # Router.OUTBOX_MESSAGE_TTL_MS (24 h)
+OUTBOX_MAX_PER_PEER = 100                    # Router.OUTBOX_MAX_PER_PEER
+HANDSHAKE_RETRY_BACKOFF_MS = (5_000, 15_000, 30_000, 60_000)  # Router.HANDSHAKE_RETRY_BACKOFF_MS
+# Not from Android (spec): a sent DM with no 0x03 after this long shows "unconfirmed".
+DM_UNCONFIRMED_AFTER_S = 30.0
+# Delivery states only move upward (never downgrade). Android NoisePayloadType:
+# READ_RECEIPT=0x02, DELIVERED=0x03.
+DM_STATE_RANK = {"sending": 0, "failed": 0, "sent": 1, "unconfirmed": 1, "delivered": 2, "read": 3}
 
 
 def _hs_debug(msg: str) -> None:
@@ -102,7 +110,7 @@ def _hs_debug(msg: str) -> None:
 
 class NoiseSession:
     """Manages a Noise_XX handshake and transport encryption with one peer."""
-    def __init__(self, our_noise_priv: bytes, peer_noise_pub: bytes, is_initiator: bool):
+    def __init__(self, our_noise_priv: bytes, peer_noise_pub: bytes, is_initiator: bool, clock=time.monotonic):
         self.our_noise_priv = our_noise_priv
         self.peer_noise_pub = peer_noise_pub
         self.is_initiator = is_initiator
@@ -118,7 +126,7 @@ class NoiseSession:
         self._send_counter = 0
         self._recv_window = set()  # simplified: track seen counters
         self._last_error = None
-        self.created_at = time.monotonic()
+        self.created_at = clock()
 
     @property
     def is_finished(self) -> bool:
@@ -200,15 +208,18 @@ class NoiseSession:
 class BLEService:
     """Central-role BLE transport speaking the real bitchat public-chat protocol."""
 
-    def __init__(self, state: ChatState, cli_redraw_callback):
+    def __init__(self, state: ChatState, cli_redraw_callback, clock=time.monotonic):
         self.state = state
         self.cli_redraw = cli_redraw_callback
+        self.clock = clock  # outbox/session timing; injectable for tests
         self.clients: Dict[str, BleakClient] = {}      # BLE address -> client
         self._connecting: Set[str] = set()
         self._write_locks: Dict[str, asyncio.Lock] = {}  # BLE address -> write lock
         self._ignored: Set[str] = set()                # confirmed non-peers / dead
         self._ignored_peers: Set[str] = set()          # peer IDs confirmed non-peers / dead (from scan response)
-        self._pending_acks: Dict[str, dict] = {}      # msg_id -> {peer_id, content, time, retries}
+        self._outbox: Dict[str, dict] = {}   # msg_id -> {peer_id, content, enqueued_at, sent_at, state}
+        self._hs_retry: Dict[str, tuple] = {}  # peer_id -> (attempts, next_at)
+        self._needs_announce: Set[str] = set()
         self._attempts: Dict[str, int] = {}
         self._cooldown_until: Dict[str, float] = {}
         self._reassembler = FragmentReassembler()
@@ -281,7 +292,7 @@ class BLEService:
             self._sync_manager._seen_packet_ids = set(self._seen_packets.keys())
         await self._sync_manager.start()
         self._hs_retry_task = asyncio.ensure_future(self._handshake_retry_loop())
-        self._dm_ack_task = asyncio.ensure_future(self._dm_ack_retry_loop())
+        self._outbox_task = asyncio.ensure_future(self._outbox_loop())
 
         try:
             while self._running:
@@ -330,66 +341,12 @@ class BLEService:
         except asyncio.CancelledError:
             raise
 
-    def _enforce_ack_cap(self) -> None:
-        """Bound _pending_acks: drop the oldest entries and warn once."""
-        if len(self._pending_acks) <= 32:
-            return
-        excess = len(self._pending_acks) - 32
-        for _ in range(excess):
-            oldest = next(iter(self._pending_acks))
-            del self._pending_acks[oldest]
-        self._warn(f"Dropping {excess} unconfirmed DM(s): too many pending.")
-
-    async def _dm_ack_retry_loop(self):
-        """Retry DMs that have not received a delivery ack."""
-        try:
-            while self._running:
-                await asyncio.sleep(5.0)
-                now = time.monotonic()
-                self._enforce_ack_cap()
-                to_retry = []
-                for msg_id in list(self._pending_acks.keys()):
-                    info = self._pending_acks.get(msg_id)
-                    if info is None:
-                        continue
-                    # The peer may have left (or been rejected) since the DM was
-                    # queued; retrying it would only burn handshake attempts.
-                    if info["peer_id"] not in self.state.peer_info:
-                        del self._pending_acks[msg_id]
-                        continue
-                    if now - info["time"] < DM_ACK_TIMEOUT:
-                        continue
-                    if info["retries"] >= DM_ACK_MAX_RETRIES:
-                        nickname = self.state.nickname_for(info["peer_id"])
-                        self._warn(
-                            f"DM to {nickname} not confirmed delivered after "
-                            f"{info['retries']} attempts"
-                        )
-                        del self._pending_acks[msg_id]
-                        continue
-                    to_retry.append((msg_id, info))
-                for msg_id, info in to_retry:
-                    info["retries"] += 1
-                    info["time"] = now
-                    dlog(f"DM_RETRY: msg_id={msg_id[:8]} attempt={info['retries']}")
-                    try:
-                        ok = await self._transmit_dm(info["peer_id"], info["content"], msg_id)
-                    except Exception as e:
-                        dlog(f"DM_RETRY failed: {e}")
-                        ok = False
-                    if not ok:
-                        nickname = self.state.nickname_for(info["peer_id"])
-                        self._warn(f"DM to {nickname} not delivered (transmission failed).")
-                        del self._pending_acks[msg_id]
-        except asyncio.CancelledError:
-            raise
-
     async def stop(self):
         self._running = False
         _t = getattr(self, "_hs_retry_task", None)
         if _t is not None:
             _t.cancel()
-        _t2 = getattr(self, "_dm_ack_task", None)
+        _t2 = getattr(self, "_outbox_task", None)
         if _t2 is not None:
             _t2.cancel()
         try:
@@ -644,7 +601,7 @@ class BLEService:
             if session is None:
                 # Create as responder
                 our_noise_priv = self.state.identity.noise_private_key_bytes()
-                session = NoiseSession(our_noise_priv, peer_noise_pub, is_initiator=False)
+                session = NoiseSession(our_noise_priv, peer_noise_pub, is_initiator=False, clock=self.clock)
                 self._noise_sessions[peer_id] = session
             elif len(packet.payload) == 32 and (session.is_finished or session.is_initiator):
                 # Phone is initiating (msg1). Replace session if:
@@ -653,7 +610,7 @@ class BLEService:
                 if session.is_finished:
                     self._sys(f"Replacing finished Noise session with {peer_id[:8]} (phone restarted)")
                 our_noise_priv = self.state.identity.noise_private_key_bytes()
-                session = NoiseSession(our_noise_priv, peer_noise_pub, is_initiator=False)
+                session = NoiseSession(our_noise_priv, peer_noise_pub, is_initiator=False, clock=self.clock)
                 self._noise_sessions[peer_id] = session
             # Handle the handshake message
             response = session.handle_handshake_message(packet.payload)
@@ -691,11 +648,15 @@ class BLEService:
                 if len(plaintext) < 2:
                     return
                 noise_type = plaintext[0]
-                if noise_type == 0x03:  # DELIVERED ack
+                if noise_type == 0x03:  # DELIVERED (Android NoisePayloadType.DELIVERED)
                     ack_msg_id = plaintext[1:].decode('utf-8', errors='replace')
                     dlog(f"DM_ACK_RECV: from={peer_id[:8]} msg_id={ack_msg_id}")
-                    self._pending_acks.pop(ack_msg_id, None)
-                    self._ok(f"DM delivered: {ack_msg_id[:8]}")
+                    self._set_dm_state(ack_msg_id, "delivered")
+                    return
+                if noise_type == 0x02:  # READ_RECEIPT (Android NoisePayloadType.READ_RECEIPT)
+                    read_msg_id = plaintext[1:].decode('utf-8', errors='replace')
+                    dlog(f"DM_READ_RECV: from={peer_id[:8]} msg_id={read_msg_id}")
+                    self._set_dm_state(read_msg_id, "read")
                     return
                 if noise_type != 0x01:  # PRIVATE_MESSAGE only
                     return
@@ -898,7 +859,7 @@ class BLEService:
         """Create a Noise session and send the first handshake message."""
         our_noise_priv = self.state.identity.noise_private_key_bytes()
         try:
-            session = NoiseSession(our_noise_priv, peer_noise_pub, is_initiator=True)
+            session = NoiseSession(our_noise_priv, peer_noise_pub, is_initiator=True, clock=self.clock)
             self._noise_sessions[peer_id_hex] = session
             msg = session.start_handshake()
             if msg:
@@ -1165,9 +1126,13 @@ class BLEService:
         return message
 
     async def _send_delivery_ack(self, recipient_peer_id: str, message_id: str):
-        """Send a DELIVERED ack, mirroring Android's sendDeliveryAck."""
+        """Send a DELIVERED (0x03) ack for a received DM, mirroring Android's sendDeliveryAck."""
         session = self._noise_sessions.get(recipient_peer_id)
-        if session is None or not session.is_finished:
+        if session is None:
+            dlog(f"DM_ACK_SKIP: no session peer={recipient_peer_id[:8]} msg_id={message_id}")
+            return
+        if not session.is_finished:
+            dlog(f"DM_ACK_SKIP: session not finished peer={recipient_peer_id[:8]} msg_id={message_id}")
             return
         try:
             ack_payload = bytes([0x03]) + message_id.encode('utf-8')
@@ -1182,44 +1147,49 @@ class BLEService:
             await self._broadcast(packet)
             dlog(f"DM_ACK_SEND: to={recipient_peer_id[:8]} msg_id={message_id}")
         except Exception as e:
-            dlog(f"DM_ACK_SEND failed: {e}")
+            dlog(f"DM_ACK_SEND failed: to={recipient_peer_id[:8]} msg_id={message_id} err={e}")
+
+    # ------------------------------------------------------------------ #
+    # DM outbox (modeled on Android MessageRouter: enqueue, tickOutbox, handshake backoff)
+    # ------------------------------------------------------------------ #
+    def _has_link(self) -> bool:
+        """True when any BLE link is up. Android gates handshake kicks on isConnected."""
+        return bool(self.clients) or bool(
+            self._peripheral is not None and self._peripheral.connected_addresses)
+
+    def _dm_session_ready(self, peer_id_hex: str) -> bool:
+        """Finished Noise session that is not older than DM_SESSION_MAX_AGE (service clock)."""
+        s = self._noise_sessions.get(peer_id_hex)
+        return (s is not None and s.is_finished
+                and (self.clock() - s.created_at) <= DM_SESSION_MAX_AGE)
+
+    def _set_dm_state(self, msg_id: str, new: str) -> bool:
+        """Move an outgoing DM to `new`. Never downgrades. Returns True if changed."""
+        e = self._outbox.get(msg_id)
+        if e is None or e["state"] == "failed":
+            return False
+        old = e["state"]
+        if new == "unconfirmed":
+            ok = old == "sent"
+        elif new == "failed":
+            ok = old == "sending"
+        else:
+            ok = DM_STATE_RANK[new] > DM_STATE_RANK[old]
+        if ok:
+            e["state"] = new
+            dlog(f"DM_STATE: msg_id={msg_id[:8]} {old}->{new}")
+        return ok
 
     async def _transmit_dm(self, peer_id_hex: str, content: str, msg_id: str) -> bool:
-        """Transmit one encrypted DM. Returns True if broadcast, False if not sent.
-
-        Does not register acks and does not echo: the caller owns msg_id.
-        """
-        session = self._noise_sessions.get(peer_id_hex)
-        # Phones drop their Noise session when their BLE link to us drops and we
-        # are not told.  Re-handshake first if the session is missing, unfinished,
-        # or older than DM_SESSION_MAX_AGE seconds.
-        if (session is None or not session.is_finished
-                or (time.monotonic() - session.created_at) > DM_SESSION_MAX_AGE):
-            peer_noise_pub = self.state.get_peer_noise_key(peer_id_hex)
-            if peer_noise_pub is None:
-                self._warn(f"DM not sent: no Noise key known for {peer_id_hex[:8]}.")
-                return False
-            self._initiate_noise_handshake(peer_id_hex, peer_noise_pub)
-            deadline = time.monotonic() + DM_HANDSHAKE_TIMEOUT
-            while time.monotonic() < deadline:
-                session = self._noise_sessions.get(peer_id_hex)
-                if session is not None and session.is_finished:
-                    break
-                await asyncio.sleep(0.1)
-            session = self._noise_sessions.get(peer_id_hex)
-            if session is None or not session.is_finished:
-                self._warn(f"DM not sent: handshake with {peer_id_hex[:8]} failed.")
-                return False
-            # The phone may have dropped the peer (and its nickname) when its link
-            # to us went down.  Re-announce now so the phone has our nickname before
-            # the DM arrives (otherwise the sender shows as 'Unknown').
-            await self.send_announce()
-            await asyncio.sleep(0.2)
+        """Encrypt and broadcast one NOISE_ENCRYPTED DM. False if no ready session."""
+        if not self._dm_session_ready(peer_id_hex):
+            dlog(f"DM_SEND_SKIP: no ready session peer={peer_id_hex[:8]} msg_id={msg_id}")
+            return False
+        session = self._noise_sessions[peer_id_hex]
         try:
             content_bytes = content.encode('utf-8')
             msg_id_bytes = msg_id.encode('utf-8')
-            # Build NoisePayload: type byte 0x01 (PRIVATE_MESSAGE) + PrivateMessagePacket TLV
-            # TLV: [0x00][len][msg_id][0x01][len][content]
+            # NoisePayload: type 0x01 (PRIVATE_MESSAGE) + TLV [0x00 msg_id][0x01 content]
             tlv = bytes([0x00, len(msg_id_bytes)]) + msg_id_bytes + bytes([0x01, len(content_bytes)]) + content_bytes
             plaintext = bytes([0x01]) + tlv
             ciphertext = session.encrypt(plaintext)
@@ -1230,26 +1200,94 @@ class BLEService:
                 payload=ciphertext,
                 ttl=DEFAULT_TTL,  # match Android: encrypted DMs use TTL 7 so other peers relay them
             ))
-            dlog(f"DM_SEND: sender={self.state.my_peer_id.hex()} recipient={peer_id_hex} ttl={DEFAULT_TTL}")
+            dlog(f"DM_SEND: sender={self.state.my_peer_id.hex()} recipient={peer_id_hex} msg_id={msg_id}")
             await self._broadcast(packet)
             return True
         except Exception as e:
             self._warn(f"Failed to send private message: {e}")
             return False
 
+    async def _flush_peer(self, peer_id_hex: str, now: float) -> None:
+        """Transmit queued DMs for a peer with a ready session, in enqueue order."""
+        if peer_id_hex in self._needs_announce:
+            # Phone may have dropped our nickname with the old link; re-announce first.
+            self._needs_announce.discard(peer_id_hex)
+            await self.send_announce()
+        for msg_id, e in list(self._outbox.items()):
+            if e["state"] == "sending" and e["peer_id"] == peer_id_hex:
+                if await self._transmit_dm(peer_id_hex, e["content"], msg_id):
+                    e["sent_at"] = now
+                    self._set_dm_state(msg_id, "sent")
+
+    async def _outbox_tick(self, now=None) -> None:
+        """One scheduler pass (Android MessageRouter.tickOutbox(nowMs)).
+
+        1. expire queued DMs older than OUTBOX_MESSAGE_TTL_MS (-> failed)
+        2. mark sent DMs with no 0x03 after DM_UNCONFIRMED_AFTER_S (-> unconfirmed)
+        3. flush peers with a ready session; otherwise kick the handshake with backoff
+        """
+        now = self.clock() if now is None else now
+        ttl_s = OUTBOX_MESSAGE_TTL_MS / 1000.0
+        for msg_id, e in list(self._outbox.items()):
+            if e["state"] == "sending" and now - e["enqueued_at"] > ttl_s:
+                self._set_dm_state(msg_id, "failed")
+                self._warn(f"DM to {self.state.nickname_for(e['peer_id'])} expired before it could be sent.")
+            elif e["state"] == "sent" and now - e["sent_at"] >= DM_UNCONFIRMED_AFTER_S:
+                self._set_dm_state(msg_id, "unconfirmed")
+        queued = []
+        for e in self._outbox.values():
+            if e["state"] == "sending" and e["peer_id"] not in queued:
+                queued.append(e["peer_id"])
+        for peer in queued:
+            if self._dm_session_ready(peer):
+                await self._flush_peer(peer, now)
+                continue
+            if not self._has_link():
+                continue
+            pub = self.state.get_peer_noise_key(peer)
+            if pub is None:
+                continue
+            attempts, next_at = self._hs_retry.get(peer, (0, 0.0))
+            if now < next_at:
+                continue
+            backoff_ms = HANDSHAKE_RETRY_BACKOFF_MS[min(attempts, len(HANDSHAKE_RETRY_BACKOFF_MS) - 1)]
+            self._hs_retry[peer] = (attempts + 1, now + backoff_ms / 1000.0)
+            self._needs_announce.add(peer)
+            dlog(f"DM_HS_KICK: peer={peer[:8]} attempt={attempts + 1} next_in_ms={backoff_ms}")
+            self._initiate_noise_handshake(peer, pub)
+
+    async def _outbox_loop(self) -> None:
+        """Background driver: only calls _outbox_tick() every OUTBOX_TICK_MS."""
+        try:
+            while self._running:
+                await asyncio.sleep(OUTBOX_TICK_MS / 1000.0)
+                try:
+                    await self._outbox_tick()
+                except Exception as e:  # noqa: BLE001 - keep the scheduler alive
+                    dlog(f"OUTBOX_TICK failed: {e}")
+        except asyncio.CancelledError:
+            raise
+
     async def send_private_message(self, peer_id_hex: str, content: str):
-        """Send an encrypted private message to a peer."""
-        content_bytes = content.encode('utf-8')
-        if len(content_bytes) > 255:
-            self._warn(f"DM content too long ({len(content_bytes)} bytes > 255) — not sent.")
-            return
+        """Queue an encrypted DM; transmit now if a session is ready. Returns msg_id or None."""
+        if len(content.encode('utf-8')) > 255:
+            self._warn(f"DM content too long ({len(content.encode('utf-8'))} bytes > 255) — not sent.")
+            return None
+        queued = [m for m, e in self._outbox.items()
+                  if e["peer_id"] == peer_id_hex and e["state"] == "sending"]
+        while len(queued) >= OUTBOX_MAX_PER_PEER:
+            oldest = queued.pop(0)
+            self._set_dm_state(oldest, "failed")
+            self._warn(f"DM to {self.state.nickname_for(peer_id_hex)} dropped: outbox full.")
         import uuid
         msg_id = str(uuid.uuid4()).upper()
-        if not await self._transmit_dm(peer_id_hex, content, msg_id):
-            return
-        self._pending_acks[msg_id] = {"peer_id": peer_id_hex, "content": content, "time": time.monotonic(), "retries": 0}
-        self._enforce_ack_cap()
+        now = self.clock()
+        self._outbox[msg_id] = {"peer_id": peer_id_hex, "content": content,
+                                "enqueued_at": now, "sent_at": None, "state": "sending"}
         self._chat(self.state.nickname, content, is_self=True, conv=peer_id_hex)
+        if self._dm_session_ready(peer_id_hex):
+            await self._flush_peer(peer_id_hex, now)
+        return msg_id
 
     async def send_leave(self):
         packet = self._sign(BitchatPacket(

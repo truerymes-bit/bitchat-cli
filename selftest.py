@@ -27,15 +27,6 @@ from bitchat_cli.protocol import (
     SIGNATURE_SIZE,
 )
 
-# ble_service pulls in noise/bleak/dbus; skip the DM retry tests when those
-# are unavailable (the rest of the suite is pure protocol and always runs).
-try:
-    import bitchat_cli.ble_service as _ble_service
-    from bitchat_cli.chat_state import ChatState as _ChatState
-    _HAVE_BLE_SERVICE = True
-except ImportError:
-    _HAVE_BLE_SERVICE = False
-
 passed = 0
 
 
@@ -300,176 +291,250 @@ def test_compute_route_shape():
           state.compute_route(SELF, SELF) is None)
 
 
-def test_dm_ack_retry_same_msg_id():
-    """A retried DM reuses its msg_id: no new ack entry, no extra echo."""
-    import asyncio as _asyncio
-    import types as _types
+# ---------------------------------------------------------------------------
+# DM outbox tests. These use a real in-process Noise_XX handshake between the
+# service and a "phone" built from the project's own NoiseSession, so every
+# 0x02/0x03 payload is produced and decrypted by real code. No mocks, no
+# patched time/asyncio. Clock is a FakeClock passed to the constructor.
+# ---------------------------------------------------------------------------
+import asyncio as _aio
+import hashlib as _hashlib
+import itertools as _itertools
 
-    ble = _ble_service
-    state = _ChatState(nickname="self", my_peer_id=bytes.fromhex("aa" * 16))
-    peer = "bb" * 16
-    state.set_peer_info(peer, "bob", b"k" * 32, b"s" * 32)
+from bitchat_cli import ble_service as _ble
+from bitchat_cli.chat_state import ChatState as _ChatState
+from bitchat_cli.identity import IdentityKeys as _IdentityKeys
+from bitchat_cli.protocol import BitchatPacket as _Packet, MessageType as _MT
 
-    svc = ble.BLEService(state, lambda: None)
+
+class FakeClock:
+    def __init__(self, t=1000.0):
+        self.t = float(t)
+
+    def __call__(self):
+        return self.t
+
+    def advance(self, seconds):
+        self.t += float(seconds)
+
+
+class RecordingBLEService(_ble.BLEService):
+    """BLEService whose outbound packets are recorded instead of written to BLE."""
+
+    def __init__(self, state, clock):
+        super().__init__(state, lambda: None, clock=clock)
+        self.sent = []    # (clock time, packet)
+        self.lines = []   # (conv, line)
+
+    async def _broadcast(self, packet):
+        self.sent.append((self.clock(), packet))
+
+    def _emit(self, line, conv=None):
+        self.lines.append((conv, line))
+
+    def _has_link(self):
+        return True
+
+    def dm_packets(self):
+        return [p for _, p in self.sent if p.type == _MT.NOISE_ENCRYPTED]
+
+    def handshake_packets(self):
+        return [(t, p) for t, p in self.sent if p.type == _MT.NOISE_HANDSHAKE]
+
+
+class Phone:
+    def __init__(self):
+        self.keys = _IdentityKeys()
+        self.peer_id = _hashlib.sha256(self.keys.noise_public_key_bytes()).digest()[:8]
+        self.peer_hex = self.peer_id.hex()
+        self.session = None
+
+
+def _make(clock):
+    state = _ChatState(nickname="self", my_peer_id=bytes.fromhex("aa" * 8))
+    svc = RecordingBLEService(state, clock)
     svc._running = True
-
-    broadcasts = []
-    echoes = []
-    warnings = []
-
-    class FakeSession:
-        def __init__(self):
-            self.created_at = ble.time.monotonic()
-            self.is_finished = True
-
-        def encrypt(self, plaintext):
-            return plaintext
-
-    svc._noise_sessions[peer] = FakeSession()
-
-    async def fake_broadcast(packet):
-        if packet.type != MessageType.NOISE_ENCRYPTED:
-            return
-        tlv = packet.payload[1:]  # fake session: ciphertext == plaintext
-        assert tlv[0] == 0
-        ln = tlv[1]
-        broadcasts.append(tlv[2:2 + ln].decode())
-
-    svc._broadcast = fake_broadcast
-    svc._chat = lambda *a, **k: echoes.append((a, k))
-    svc._warn = lambda msg, conv=None: warnings.append(msg)
-
-    clock = [1000.0]
-    real_time = ble.time
-    ble.time = _types.SimpleNamespace(monotonic=lambda: clock[0], time=real_time.time)
-    real_sleep = _asyncio.sleep
-    real_ack_timeout = ble.DM_ACK_TIMEOUT
-    real_max_retries = ble.DM_ACK_MAX_RETRIES
-    ble.DM_ACK_TIMEOUT = 0.0005
-
-    async def fake_sleep(delay, result=None):
-        # Only the retry loop's 5s pass advances the clock; the test's own
-        # yields must not, or the fake session would age out.
-        await real_sleep(0)  # yield to the event loop
-        if delay >= 1.0:
-            clock[0] += 0.001
-        return result
-
-    _asyncio.sleep = fake_sleep
-    try:
-        async def scenario():
-            await svc.send_private_message(peer, "hello")
-            task = _asyncio.ensure_future(svc._dm_ack_retry_loop())
-            for _ in range(200000):
-                if not svc._pending_acks and len(broadcasts) >= 1 + real_max_retries:
-                    break
-                await _asyncio.sleep(0)
-            task.cancel()
-            try:
-                await task
-            except _asyncio.CancelledError:
-                pass
-
-        _asyncio.run(scenario())
-    finally:
-        _asyncio.sleep = real_sleep
-        ble.time = real_time
-        ble.DM_ACK_TIMEOUT = real_ack_timeout
-
-    check("initial + max retries broadcasts",
-          len(broadcasts) == 1 + real_max_retries)
-    check("all broadcasts carry the same msg_id", len(set(broadcasts)) == 1)
-    check("exactly one echo", len(echoes) == 1)
-    check("pending acks drained", svc._pending_acks == {})
-    check("exactly one failure warning", len(warnings) == 1)
-    check("failure warning names the peer",
-          bool(warnings) and "bob" in warnings[0] and "not confirmed delivered" in warnings[0])
+    phone = Phone()
+    state.set_peer_info(phone.peer_hex, "bob",
+                        phone.keys.noise_public_key_bytes(),
+                        phone.keys.signing_public_key_bytes())
+    return svc, phone
 
 
-def test_dm_ack_received_stops_retries():
-    """An ack after the first retry stops further retries."""
-    import asyncio as _asyncio
-    import types as _types
+async def _establish(svc, phone):
+    """Real Noise_XX handshake: service is initiator, phone is responder."""
+    svc._initiate_noise_handshake(phone.peer_hex, phone.keys.noise_public_key_bytes())
+    await _aio.sleep(0)
+    await _complete_handshake(svc, phone)
 
-    ble = _ble_service
-    state = _ChatState(nickname="self", my_peer_id=bytes.fromhex("aa" * 16))
-    peer = "bb" * 16
-    state.set_peer_info(peer, "bob", b"k" * 32, b"s" * 32)
 
-    svc = ble.BLEService(state, lambda: None)
-    svc._running = True
+async def _complete_handshake(svc, phone):
+    """Answer the service's latest handshake message with the phone's side."""
+    await _aio.sleep(0)
+    msg1 = svc.handshake_packets()[-1][1].payload
+    phone.session = _ble.NoiseSession(
+        phone.keys.noise_private_key_bytes(),
+        svc.state.identity.noise_public_key_bytes(),
+        is_initiator=False)
+    msg2 = phone.session.handle_handshake_message(msg1)
+    assert msg2, "phone produced no msg2"
+    svc._dispatch(_Packet(type=_MT.NOISE_HANDSHAKE, sender_id=phone.peer_id,
+                          recipient_id=svc.state.my_peer_id, payload=msg2))
+    await _aio.sleep(0)
+    msg3 = svc.handshake_packets()[-1][1].payload
+    phone.session.handle_handshake_message(msg3)
+    assert phone.session.is_finished, "phone handshake not finished"
+    assert svc._noise_sessions[phone.peer_hex].is_finished, "service handshake not finished"
 
-    broadcasts = []
-    echoes = []
-    warnings = []
 
-    class FakeSession:
-        def __init__(self):
-            self.created_at = ble.time.monotonic()
-            self.is_finished = True
+def _phone_to_service(svc, phone, plaintext):
+    """Phone encrypts a NoisePayload and the service receives it via _dispatch."""
+    svc._dispatch(_Packet(type=_MT.NOISE_ENCRYPTED, sender_id=phone.peer_id,
+                          recipient_id=svc.state.my_peer_id,
+                          payload=phone.session.encrypt(plaintext)))
 
-        def encrypt(self, plaintext):
-            return plaintext
 
-    svc._noise_sessions[peer] = FakeSession()
+def _ack(kind, msg_id):
+    return bytes([kind]) + msg_id.encode("utf-8")
 
-    async def fake_broadcast(packet):
-        if packet.type != MessageType.NOISE_ENCRYPTED:
-            return
-        tlv = packet.payload[1:]
-        ln = tlv[1]
-        msg_id = tlv[2:2 + ln].decode()
-        broadcasts.append(msg_id)
-        if len(broadcasts) == 2:
-            # The ack arrives right after the first retry.
-            svc._pending_acks.pop(msg_id, None)
 
-    svc._broadcast = fake_broadcast
-    svc._chat = lambda *a, **k: echoes.append((a, k))
-    svc._warn = lambda msg, conv=None: warnings.append(msg)
+def _decrypt_dm(phone, packet):
+    pt = phone.session.decrypt(packet.payload)
+    assert pt[0] == 0x01, f"not a PRIVATE_MESSAGE: type {pt[0]}"
+    rest = pt[1:]
+    assert rest[0] == 0x00
+    mid = rest[2:2 + rest[1]].decode()
+    rest = rest[2 + rest[1]:]
+    assert rest[0] == 0x01
+    return mid, rest[2:2 + rest[1]].decode()
 
-    clock = [1000.0]
-    real_time = ble.time
-    ble.time = _types.SimpleNamespace(monotonic=lambda: clock[0], time=real_time.time)
-    real_sleep = _asyncio.sleep
-    real_ack_timeout = ble.DM_ACK_TIMEOUT
-    ble.DM_ACK_TIMEOUT = 0.0005
 
-    async def fake_sleep(delay, result=None):
-        # Only the retry loop's 5s pass advances the clock; the test's own
-        # yields must not, or the fake session would age out.
-        await real_sleep(0)  # yield to the event loop
-        if delay >= 1.0:
-            clock[0] += 0.001
-        return result
+def test_dm_sent_once_never_retransmitted():
+    clock = FakeClock()
 
-    _asyncio.sleep = fake_sleep
-    try:
-        async def scenario():
-            await svc.send_private_message(peer, "hello")
-            task = _asyncio.ensure_future(svc._dm_ack_retry_loop())
-            for _ in range(200000):
-                if len(broadcasts) >= 2:
-                    break
-                await _asyncio.sleep(0)
-            for _ in range(50):
-                await _asyncio.sleep(0)
-            task.cancel()
-            try:
-                await task
-            except _asyncio.CancelledError:
-                pass
+    async def run():
+        svc, phone = _make(clock)
+        await _establish(svc, phone)
+        msg_id = await svc.send_private_message(phone.peer_hex, "hello phone")
+        await _aio.sleep(0)
+        check("DM with ready session transmits immediately", len(svc.dm_packets()) == 1)
+        check("sent DM decrypts on phone side to same msg_id and text",
+              _decrypt_dm(phone, svc.dm_packets()[0]) == (msg_id, "hello phone"))
+        check("state after broadcast is sent", svc._outbox[msg_id]["state"] == "sent")
+        for _ in range(60):
+            clock.advance(60)  # one hour of ticks, no ack ever arrives
+            await svc._outbox_tick()
+            await _aio.sleep(0)
+        check("never retransmitted after many ticks (still exactly 1 DM)",
+              len(svc.dm_packets()) == 1)
+        check("state ends unconfirmed", svc._outbox[msg_id]["state"] == "unconfirmed")
 
-        _asyncio.run(scenario())
-    finally:
-        _asyncio.sleep = real_sleep
-        ble.time = real_time
-        ble.DM_ACK_TIMEOUT = real_ack_timeout
+    _aio.run(run())
 
-    check("initial + one retry broadcast", len(broadcasts) == 2)
-    check("ack removed the pending entry", svc._pending_acks == {})
-    check("no failure warning", warnings == [])
-    check("exactly one echo", len(echoes) == 1)
+
+def test_dm_delivery_states_never_downgrade():
+    clock = FakeClock()
+
+    async def run():
+        svc, phone = _make(clock)
+        await _establish(svc, phone)
+        msg_id = await svc.send_private_message(phone.peer_hex, "status")
+        st = lambda: svc._outbox[msg_id]["state"]
+        check("sent before any receipt", st() == "sent")
+        _phone_to_service(svc, phone, _ack(0x03, msg_id))
+        check("real 0x03 moves sent -> delivered", st() == "delivered")
+        clock.advance(600)
+        _phone_to_service(svc, phone, _ack(0x02, msg_id))
+        check("real 0x02 moves delivered -> read", st() == "read")
+        _phone_to_service(svc, phone, _ack(0x03, msg_id))
+        check("late 0x03 after read does not downgrade", st() == "read")
+        await svc._outbox_tick()
+        check("tick does not mark a read DM unconfirmed", st() == "read")
+        check("no DM retransmitted by any of this", len(svc.dm_packets()) == 1)
+
+    _aio.run(run())
+
+
+def test_queued_dm_waits_for_handshake_and_backoff():
+    clock = FakeClock(1000.0)
+    t0 = clock()
+
+    async def run():
+        svc, phone = _make(clock)
+        msg_id = await svc.send_private_message(phone.peer_hex, "later")
+        await _aio.sleep(0)
+        check("no session: DM stays queued", svc._outbox[msg_id]["state"] == "sending")
+        check("no session: nothing transmitted at send time",
+              svc.dm_packets() == [] and svc.handshake_packets() == [])
+        # Tick every second for 60 s and record when handshakes are kicked.
+        kicks = []
+        for _ in range(61):
+            before = len(svc.handshake_packets())
+            await svc._outbox_tick()
+            await _aio.sleep(0)
+            if len(svc.handshake_packets()) > before:
+                kicks.append(clock() - t0)
+            clock.advance(1)
+        # Schedule implied by Android HANDSHAKE_RETRY_BACKOFF_MS: kick, then wait
+        # backoff[attempt] (last value repeats).
+        expected = []
+        at = 0.0
+        for i in range(len(kicks)):
+            expected.append(at)
+            at += _ble.HANDSHAKE_RETRY_BACKOFF_MS[min(i, len(_ble.HANDSHAKE_RETRY_BACKOFF_MS) - 1)] / 1000.0
+        check(f"handshake kicks follow Android backoff {kicks}", kicks == expected and len(kicks) >= 4)
+        check("still queued while no session", svc._outbox[msg_id]["state"] == "sending")
+        check("no DM sent before handshake finishes", svc.dm_packets() == [])
+        await _complete_handshake(svc, phone)
+        await svc._outbox_tick()
+        await _aio.sleep(0)
+        check("flushed after handshake finished: 1 DM", len(svc.dm_packets()) == 1)
+        check("flushed DM decrypts to queued text",
+              _decrypt_dm(phone, svc.dm_packets()[0])[1] == "later")
+        check("state sent after flush", svc._outbox[msg_id]["state"] == "sent")
+
+    _aio.run(run())
+
+
+def test_queue_expiry_marks_failed_and_sends_nothing():
+    clock = FakeClock()
+    t0 = clock()
+
+    async def run():
+        svc, phone = _make(clock)
+        msg_id = await svc.send_private_message(phone.peer_hex, "stuck")
+        check("content over 255 bytes is refused",
+              await svc.send_private_message(phone.peer_hex, "x" * 256) is None)
+        ttl = _ble.OUTBOX_MESSAGE_TTL_MS / 1000.0
+        while clock() - t0 <= ttl + 3600:
+            clock.advance(3600)
+            await svc._outbox_tick()
+            await _aio.sleep(0)
+        check("expired queued DM is failed", svc._outbox[msg_id]["state"] == "failed")
+        check("expired DM sends no DM packet", svc.dm_packets() == [])
+        check("expiry is reported", any("expired" in line for _, line in svc.lines))
+
+    _aio.run(run())
+
+
+def test_incoming_dm_gets_real_delivery_ack():
+    clock = FakeClock()
+
+    async def run():
+        svc, phone = _make(clock)
+        await _establish(svc, phone)
+        incoming = "PHONE-MSG-0001"
+        tlv = bytes([0x00, len(incoming)]) + incoming.encode() + bytes([0x01, 2]) + b"hi"
+        _phone_to_service(svc, phone, bytes([0x01]) + tlv)
+        await _aio.sleep(0)
+        await _aio.sleep(0)
+        acks = svc.dm_packets()
+        check("incoming DM produces exactly one ack packet", len(acks) == 1)
+        pt = phone.session.decrypt(acks[0].payload)
+        check("ack is a real 0x03 that decrypts on the phone to the same msg_id",
+              pt[0] == 0x03 and pt[1:].decode() == incoming)
+
+    _aio.run(run())
 
 
 if __name__ == "__main__":
@@ -488,11 +553,13 @@ if __name__ == "__main__":
         test_mime_helpers,
         test_public_message_payload_is_raw,
         test_compute_route_shape,
+        test_dm_sent_once_never_retransmitted,
+        test_dm_delivery_states_never_downgrade,
+        test_queued_dm_waits_for_handshake_and_backoff,
+        test_queue_expiry_marks_failed_and_sends_nothing,
+        test_incoming_dm_gets_real_delivery_ack,
     ]
-    if _HAVE_BLE_SERVICE:
-        tests.append(test_dm_ack_retry_same_msg_id)
-        tests.append(test_dm_ack_received_stops_retries)
     for test in tests:
         print(f"{test.__name__}:")
         test()
-    print(f"\nAll {passed} checks passed. ✅")
+    print(f"\nAll {passed} checks passed.")
