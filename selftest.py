@@ -537,6 +537,75 @@ def test_incoming_dm_gets_real_delivery_ack():
     _aio.run(run())
 
 
+class _PhoneReader:
+    """Decrypts the service's NOISE_ENCRYPTED payloads once each, in order (replay window)."""
+
+    def __init__(self, svc, phone):
+        self.svc = svc
+        self.phone = phone
+        self.n = 0
+
+    def new_plaintexts(self):
+        packets = self.svc.dm_packets()
+        out = [self.phone.session.decrypt(p.payload) for p in packets[self.n:]]
+        self.n = len(packets)
+        return out
+
+
+def _receipt_ids(plaintexts):
+    return [pt[1:].decode() for pt in plaintexts if pt[0] == 0x02]
+
+
+def test_read_receipts_once_per_unread_message():
+    clock = FakeClock()
+
+    async def run():
+        svc, phone = _make(clock)
+        await _establish(svc, phone)
+        peer = phone.peer_hex
+        reader = _PhoneReader(svc, phone)
+
+        def phone_dm(mid):
+            tlv = bytes([0x00, len(mid)]) + mid.encode() + bytes([0x01, 2]) + b"hi"
+            _phone_to_service(svc, phone, bytes([0x01]) + tlv)
+
+        phone_dm("IN-A")
+        phone_dm("IN-B")
+        await _aio.sleep(0)
+        await _aio.sleep(0)
+        check("no read receipt while the tab is not active",
+              _receipt_ids(reader.new_plaintexts()) == [])
+        await svc.read_receipts_for_peer(peer)
+        check("tab activation sends exactly one 0x02 per unread msg_id",
+              sorted(_receipt_ids(reader.new_plaintexts())) == ["IN-A", "IN-B"])
+        await svc.read_receipts_for_peer(peer)
+        check("second activation sends none",
+              _receipt_ids(reader.new_plaintexts()) == [])
+
+        # No finished session: not marked sent, stays unread, next trigger retries.
+        phone_dm("IN-C")
+        await _aio.sleep(0)
+        await _aio.sleep(0)
+        saved = svc._noise_sessions.pop(peer)
+        await svc.read_receipts_for_peer(peer)
+        check("no session: nothing sent and message stays unread",
+              _receipt_ids(reader.new_plaintexts()) == [] and svc._unread_incoming.get(peer) == ["IN-C"])
+        svc._noise_sessions[peer] = saved
+        await svc.read_receipts_for_peer(peer)
+        check("next trigger with a session sends the held receipt",
+              _receipt_ids(reader.new_plaintexts()) == ["IN-C"])
+
+        # Incoming DM while its tab is visible and focused: receipt goes out at once.
+        svc.dm_visible = lambda peer_id: peer_id == peer
+        phone_dm("IN-D")
+        for _ in range(3):
+            await _aio.sleep(0)
+        check("incoming DM in a visible, focused tab is read at once",
+              _receipt_ids(reader.new_plaintexts()) == ["IN-D"])
+
+    _aio.run(run())
+
+
 if __name__ == "__main__":
     print("Running bitchat-cli protocol self-tests...\n")
     tests = [
@@ -558,6 +627,7 @@ if __name__ == "__main__":
         test_queued_dm_waits_for_handshake_and_backoff,
         test_queue_expiry_marks_failed_and_sends_nothing,
         test_incoming_dm_gets_real_delivery_ack,
+        test_read_receipts_once_per_unread_message,
     ]
     for test in tests:
         print(f"{test.__name__}:")

@@ -220,6 +220,9 @@ class BLEService:
         self._outbox: Dict[str, dict] = {}   # msg_id -> {peer_id, content, enqueued_at, sent_at, state}
         self._hs_retry: Dict[str, tuple] = {}  # peer_id -> (attempts, next_at)
         self._needs_announce: Set[str] = set()
+        self._unread_incoming: Dict[str, List[str]] = {}  # peer -> incoming DM msg_ids not yet read-receipted
+        self._sent_read_receipts: Set[str] = set()        # msg_ids we already sent a READ_RECEIPT for
+        self.dm_visible = lambda peer_id: False           # UI hook: is this DM tab shown and the app focused?
         self._attempts: Dict[str, int] = {}
         self._cooldown_until: Dict[str, float] = {}
         self._reassembler = FragmentReassembler()
@@ -688,6 +691,12 @@ class BLEService:
                 # Send delivery ACK back, mirroring Android's sendDeliveryAck.
                 if msg_id is not None:
                     asyncio.ensure_future(self._send_delivery_ack(peer_id, msg_id))
+                    unread = self._unread_incoming.setdefault(peer_id, [])
+                    if msg_id not in unread:
+                        unread.append(msg_id)
+                    # PrivateChatManager model: a DM arriving in the visible, focused tab is read at once.
+                    if self.dm_visible(peer_id):
+                        asyncio.ensure_future(self.read_receipts_for_peer(peer_id))
                 return
 
             except Exception as e:
@@ -1152,6 +1161,50 @@ class BLEService:
     # ------------------------------------------------------------------ #
     # DM outbox (modeled on Android MessageRouter: enqueue, tickOutbox, handshake backoff)
     # ------------------------------------------------------------------ #
+    async def send_read_receipt(self, peer_id_hex: str, message_id: str) -> bool:
+        """Send a READ_RECEIPT (0x02) for a received DM, once per msg_id.
+
+        Returns True if sent now or already sent; False if no finished session
+        (the caller keeps the message unread so the next trigger retries).
+        """
+        if message_id in self._sent_read_receipts:
+            return True
+        session = self._noise_sessions.get(peer_id_hex)
+        if session is None:
+            dlog(f"DM_READ_SKIP: no session peer={peer_id_hex[:8]} msg_id={message_id}")
+            return False
+        if not session.is_finished:
+            dlog(f"DM_READ_SKIP: session not finished peer={peer_id_hex[:8]} msg_id={message_id}")
+            return False
+        try:
+            payload = session.encrypt(bytes([0x02]) + message_id.encode('utf-8'))
+            packet = self._sign(BitchatPacket(
+                type=MessageType.NOISE_ENCRYPTED,
+                sender_id=self.state.my_peer_id,
+                recipient_id=bytes.fromhex(peer_id_hex),
+                payload=payload,
+                ttl=DEFAULT_TTL,  # same TTL as the delivery ack
+            ))
+            await self._broadcast(packet)
+            self._sent_read_receipts.add(message_id)
+            dlog(f"DM_READ_SEND: to={peer_id_hex[:8]} msg_id={message_id}")
+            return True
+        except Exception as e:
+            dlog(f"DM_READ_SEND failed: to={peer_id_hex[:8]} msg_id={message_id} err={e}")
+            return False
+
+    async def read_receipts_for_peer(self, peer_id_hex: str) -> None:
+        """Send one read receipt per unread incoming DM from this peer (PrivateChatManager model)."""
+        sent = set()
+        for mid in list(self._unread_incoming.get(peer_id_hex, [])):
+            if await self.send_read_receipt(peer_id_hex, mid):
+                sent.add(mid)
+        remaining = [m for m in self._unread_incoming.get(peer_id_hex, []) if m not in sent]
+        if remaining:
+            self._unread_incoming[peer_id_hex] = remaining
+        else:
+            self._unread_incoming.pop(peer_id_hex, None)
+
     def _has_link(self) -> bool:
         """True when any BLE link is up. Android gates handshake kicks on isConnected."""
         return bool(self.clients) or bool(

@@ -61,6 +61,7 @@ class BitchatApp(App):
         self.ble_service = BLEService(state, self._request_redraw)
         self.cli = CLI(state)
         self.cli.ble_service = self.ble_service
+        self.ble_service.dm_visible = self._dm_visible
         self.cli._out = lambda line, conv=None: self.event_bus.publish_nowait(
             AppEvent(EventType.OUTPUT, line, conv)
         )
@@ -146,10 +147,17 @@ class BitchatApp(App):
                 keys.append(tab_id[len("tab-"):])
         return keys
 
+    def _dm_visible(self, peer_id_hex: str) -> bool:
+        # A DM counts as read only while its tab is shown and the app has focus.
+        return self._current_conv == peer_id_hex and self.app_focus
+
     def _switch_conv(self, key: str) -> None:
         if key not in self.conversations:
             self._ensure_conv(key)
         self._current_conv = key
+        if key != GENERAL:
+            # Activating a DM tab sends a read receipt for each unread incoming message.
+            self.run_worker(self.ble_service.read_receipts_for_peer(key))
         try:
             tabs = self.query_one("#conv-tabs", Tabs)
             if tabs.get_tab(self._tab_id(key)) is not None:

@@ -34,6 +34,7 @@ def _make_app(nickname: str = "Tester"):
     app.ble_service.send_public_message = AsyncMock()  # type: ignore[assignment]
     app.ble_service.send_private_message = AsyncMock()  # type: ignore[assignment]
     app.ble_service.send_file = AsyncMock()  # type: ignore[assignment]
+    app.ble_service.read_receipts_for_peer = AsyncMock()  # type: ignore[assignment]
     return app, state
 
 
@@ -108,6 +109,7 @@ async def _scenario(size: tuple[int, int], label: str) -> None:
         await pilot.pause()
         await asyncio.sleep(0.1)
         assert app._current_conv == FAKE_PEER
+        app.ble_service.read_receipts_for_peer.assert_awaited_with(FAKE_PEER)
 
         await _submit(pilot, app, "hello")
         app.ble_service.send_private_message.assert_awaited_once_with(FAKE_PEER, "hello")
