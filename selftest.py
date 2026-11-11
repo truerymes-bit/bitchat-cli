@@ -27,6 +27,15 @@ from bitchat_cli.protocol import (
     SIGNATURE_SIZE,
 )
 
+# ble_service pulls in noise/bleak/dbus; skip the DM retry tests when those
+# are unavailable (the rest of the suite is pure protocol and always runs).
+try:
+    import bitchat_cli.ble_service as _ble_service
+    from bitchat_cli.chat_state import ChatState as _ChatState
+    _HAVE_BLE_SERVICE = True
+except ImportError:
+    _HAVE_BLE_SERVICE = False
+
 passed = 0
 
 
@@ -291,9 +300,181 @@ def test_compute_route_shape():
           state.compute_route(SELF, SELF) is None)
 
 
+def test_dm_ack_retry_same_msg_id():
+    """A retried DM reuses its msg_id: no new ack entry, no extra echo."""
+    import asyncio as _asyncio
+    import types as _types
+
+    ble = _ble_service
+    state = _ChatState(nickname="self", my_peer_id=bytes.fromhex("aa" * 16))
+    peer = "bb" * 16
+    state.set_peer_info(peer, "bob", b"k" * 32, b"s" * 32)
+
+    svc = ble.BLEService(state, lambda: None)
+    svc._running = True
+
+    broadcasts = []
+    echoes = []
+    warnings = []
+
+    class FakeSession:
+        def __init__(self):
+            self.created_at = ble.time.monotonic()
+            self.is_finished = True
+
+        def encrypt(self, plaintext):
+            return plaintext
+
+    svc._noise_sessions[peer] = FakeSession()
+
+    async def fake_broadcast(packet):
+        if packet.type != MessageType.NOISE_ENCRYPTED:
+            return
+        tlv = packet.payload[1:]  # fake session: ciphertext == plaintext
+        assert tlv[0] == 0
+        ln = tlv[1]
+        broadcasts.append(tlv[2:2 + ln].decode())
+
+    svc._broadcast = fake_broadcast
+    svc._chat = lambda *a, **k: echoes.append((a, k))
+    svc._warn = lambda msg, conv=None: warnings.append(msg)
+
+    clock = [1000.0]
+    real_time = ble.time
+    ble.time = _types.SimpleNamespace(monotonic=lambda: clock[0], time=real_time.time)
+    real_sleep = _asyncio.sleep
+    real_ack_timeout = ble.DM_ACK_TIMEOUT
+    real_max_retries = ble.DM_ACK_MAX_RETRIES
+    ble.DM_ACK_TIMEOUT = 0.0005
+
+    async def fake_sleep(delay, result=None):
+        # Only the retry loop's 5s pass advances the clock; the test's own
+        # yields must not, or the fake session would age out.
+        await real_sleep(0)  # yield to the event loop
+        if delay >= 1.0:
+            clock[0] += 0.001
+        return result
+
+    _asyncio.sleep = fake_sleep
+    try:
+        async def scenario():
+            await svc.send_private_message(peer, "hello")
+            task = _asyncio.ensure_future(svc._dm_ack_retry_loop())
+            for _ in range(200000):
+                if not svc._pending_acks and len(broadcasts) >= 1 + real_max_retries:
+                    break
+                await _asyncio.sleep(0)
+            task.cancel()
+            try:
+                await task
+            except _asyncio.CancelledError:
+                pass
+
+        _asyncio.run(scenario())
+    finally:
+        _asyncio.sleep = real_sleep
+        ble.time = real_time
+        ble.DM_ACK_TIMEOUT = real_ack_timeout
+
+    check("initial + max retries broadcasts",
+          len(broadcasts) == 1 + real_max_retries)
+    check("all broadcasts carry the same msg_id", len(set(broadcasts)) == 1)
+    check("exactly one echo", len(echoes) == 1)
+    check("pending acks drained", svc._pending_acks == {})
+    check("exactly one failure warning", len(warnings) == 1)
+    check("failure warning names the peer",
+          bool(warnings) and "bob" in warnings[0] and "not confirmed delivered" in warnings[0])
+
+
+def test_dm_ack_received_stops_retries():
+    """An ack after the first retry stops further retries."""
+    import asyncio as _asyncio
+    import types as _types
+
+    ble = _ble_service
+    state = _ChatState(nickname="self", my_peer_id=bytes.fromhex("aa" * 16))
+    peer = "bb" * 16
+    state.set_peer_info(peer, "bob", b"k" * 32, b"s" * 32)
+
+    svc = ble.BLEService(state, lambda: None)
+    svc._running = True
+
+    broadcasts = []
+    echoes = []
+    warnings = []
+
+    class FakeSession:
+        def __init__(self):
+            self.created_at = ble.time.monotonic()
+            self.is_finished = True
+
+        def encrypt(self, plaintext):
+            return plaintext
+
+    svc._noise_sessions[peer] = FakeSession()
+
+    async def fake_broadcast(packet):
+        if packet.type != MessageType.NOISE_ENCRYPTED:
+            return
+        tlv = packet.payload[1:]
+        ln = tlv[1]
+        msg_id = tlv[2:2 + ln].decode()
+        broadcasts.append(msg_id)
+        if len(broadcasts) == 2:
+            # The ack arrives right after the first retry.
+            svc._pending_acks.pop(msg_id, None)
+
+    svc._broadcast = fake_broadcast
+    svc._chat = lambda *a, **k: echoes.append((a, k))
+    svc._warn = lambda msg, conv=None: warnings.append(msg)
+
+    clock = [1000.0]
+    real_time = ble.time
+    ble.time = _types.SimpleNamespace(monotonic=lambda: clock[0], time=real_time.time)
+    real_sleep = _asyncio.sleep
+    real_ack_timeout = ble.DM_ACK_TIMEOUT
+    ble.DM_ACK_TIMEOUT = 0.0005
+
+    async def fake_sleep(delay, result=None):
+        # Only the retry loop's 5s pass advances the clock; the test's own
+        # yields must not, or the fake session would age out.
+        await real_sleep(0)  # yield to the event loop
+        if delay >= 1.0:
+            clock[0] += 0.001
+        return result
+
+    _asyncio.sleep = fake_sleep
+    try:
+        async def scenario():
+            await svc.send_private_message(peer, "hello")
+            task = _asyncio.ensure_future(svc._dm_ack_retry_loop())
+            for _ in range(200000):
+                if len(broadcasts) >= 2:
+                    break
+                await _asyncio.sleep(0)
+            for _ in range(50):
+                await _asyncio.sleep(0)
+            task.cancel()
+            try:
+                await task
+            except _asyncio.CancelledError:
+                pass
+
+        _asyncio.run(scenario())
+    finally:
+        _asyncio.sleep = real_sleep
+        ble.time = real_time
+        ble.DM_ACK_TIMEOUT = real_ack_timeout
+
+    check("initial + one retry broadcast", len(broadcasts) == 2)
+    check("ack removed the pending entry", svc._pending_acks == {})
+    check("no failure warning", warnings == [])
+    check("exactly one echo", len(echoes) == 1)
+
+
 if __name__ == "__main__":
     print("Running bitchat-cli protocol self-tests...\n")
-    for test in (
+    tests = [
         test_padding,
         test_packet_roundtrip,
         test_signature_matches_canonical,
@@ -307,7 +488,11 @@ if __name__ == "__main__":
         test_mime_helpers,
         test_public_message_payload_is_raw,
         test_compute_route_shape,
-    ):
+    ]
+    if _HAVE_BLE_SERVICE:
+        tests.append(test_dm_ack_retry_same_msg_id)
+        tests.append(test_dm_ack_received_stops_retries)
+    for test in tests:
         print(f"{test.__name__}:")
         test()
     print(f"\nAll {passed} checks passed. ✅")

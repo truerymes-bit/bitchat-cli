@@ -330,21 +330,41 @@ class BLEService:
         except asyncio.CancelledError:
             raise
 
+    def _enforce_ack_cap(self) -> None:
+        """Bound _pending_acks: drop the oldest entries and warn once."""
+        if len(self._pending_acks) <= 32:
+            return
+        excess = len(self._pending_acks) - 32
+        for _ in range(excess):
+            oldest = next(iter(self._pending_acks))
+            del self._pending_acks[oldest]
+        self._warn(f"Dropping {excess} unconfirmed DM(s): too many pending.")
+
     async def _dm_ack_retry_loop(self):
         """Retry DMs that have not received a delivery ack."""
         try:
             while self._running:
                 await asyncio.sleep(5.0)
                 now = time.monotonic()
+                self._enforce_ack_cap()
                 to_retry = []
                 for msg_id in list(self._pending_acks.keys()):
                     info = self._pending_acks.get(msg_id)
                     if info is None:
                         continue
+                    # The peer may have left (or been rejected) since the DM was
+                    # queued; retrying it would only burn handshake attempts.
+                    if info["peer_id"] not in self.state.peer_info:
+                        del self._pending_acks[msg_id]
+                        continue
                     if now - info["time"] < DM_ACK_TIMEOUT:
                         continue
                     if info["retries"] >= DM_ACK_MAX_RETRIES:
-                        self._warn(f"DM delivery failed (no ack): {msg_id[:8]}")
+                        nickname = self.state.nickname_for(info["peer_id"])
+                        self._warn(
+                            f"DM to {nickname} not confirmed delivered after "
+                            f"{info['retries']} attempts"
+                        )
                         del self._pending_acks[msg_id]
                         continue
                     to_retry.append((msg_id, info))
@@ -353,9 +373,14 @@ class BLEService:
                     info["time"] = now
                     dlog(f"DM_RETRY: msg_id={msg_id[:8]} attempt={info['retries']}")
                     try:
-                        await self.send_private_message(info["peer_id"], info["content"])
+                        ok = await self._transmit_dm(info["peer_id"], info["content"], msg_id)
                     except Exception as e:
                         dlog(f"DM_RETRY failed: {e}")
+                        ok = False
+                    if not ok:
+                        nickname = self.state.nickname_for(info["peer_id"])
+                        self._warn(f"DM to {nickname} not delivered (transmission failed).")
+                        del self._pending_acks[msg_id]
         except asyncio.CancelledError:
             raise
 
@@ -1159,8 +1184,11 @@ class BLEService:
         except Exception as e:
             dlog(f"DM_ACK_SEND failed: {e}")
 
-    async def send_private_message(self, peer_id_hex: str, content: str):
-        """Send an encrypted private message to a peer."""
+    async def _transmit_dm(self, peer_id_hex: str, content: str, msg_id: str) -> bool:
+        """Transmit one encrypted DM. Returns True if broadcast, False if not sent.
+
+        Does not register acks and does not echo: the caller owns msg_id.
+        """
         session = self._noise_sessions.get(peer_id_hex)
         # Phones drop their Noise session when their BLE link to us drops and we
         # are not told.  Re-handshake first if the session is missing, unfinished,
@@ -1170,7 +1198,7 @@ class BLEService:
             peer_noise_pub = self.state.get_peer_noise_key(peer_id_hex)
             if peer_noise_pub is None:
                 self._warn(f"DM not sent: no Noise key known for {peer_id_hex[:8]}.")
-                return
+                return False
             self._initiate_noise_handshake(peer_id_hex, peer_noise_pub)
             deadline = time.monotonic() + DM_HANDSHAKE_TIMEOUT
             while time.monotonic() < deadline:
@@ -1181,22 +1209,17 @@ class BLEService:
             session = self._noise_sessions.get(peer_id_hex)
             if session is None or not session.is_finished:
                 self._warn(f"DM not sent: handshake with {peer_id_hex[:8]} failed.")
-                return
+                return False
             # The phone may have dropped the peer (and its nickname) when its link
             # to us went down.  Re-announce now so the phone has our nickname before
             # the DM arrives (otherwise the sender shows as 'Unknown').
             await self.send_announce()
             await asyncio.sleep(0.2)
         try:
-            import uuid
-            msg_id = str(uuid.uuid4()).upper()
             content_bytes = content.encode('utf-8')
-            if len(content_bytes) > 255:
-                self._warn(f"DM content too long ({len(content_bytes)} bytes > 255) — not sent.")
-                return
+            msg_id_bytes = msg_id.encode('utf-8')
             # Build NoisePayload: type byte 0x01 (PRIVATE_MESSAGE) + PrivateMessagePacket TLV
             # TLV: [0x00][len][msg_id][0x01][len][content]
-            msg_id_bytes = msg_id.encode('utf-8')
             tlv = bytes([0x00, len(msg_id_bytes)]) + msg_id_bytes + bytes([0x01, len(content_bytes)]) + content_bytes
             plaintext = bytes([0x01]) + tlv
             ciphertext = session.encrypt(plaintext)
@@ -1209,10 +1232,24 @@ class BLEService:
             ))
             dlog(f"DM_SEND: sender={self.state.my_peer_id.hex()} recipient={peer_id_hex} ttl={DEFAULT_TTL}")
             await self._broadcast(packet)
-            self._pending_acks[msg_id] = {"peer_id": peer_id_hex, "content": content, "time": time.monotonic(), "retries": 0}
-            self._chat(self.state.nickname, content, is_self=True, conv=peer_id_hex)
+            return True
         except Exception as e:
             self._warn(f"Failed to send private message: {e}")
+            return False
+
+    async def send_private_message(self, peer_id_hex: str, content: str):
+        """Send an encrypted private message to a peer."""
+        content_bytes = content.encode('utf-8')
+        if len(content_bytes) > 255:
+            self._warn(f"DM content too long ({len(content_bytes)} bytes > 255) — not sent.")
+            return
+        import uuid
+        msg_id = str(uuid.uuid4()).upper()
+        if not await self._transmit_dm(peer_id_hex, content, msg_id):
+            return
+        self._pending_acks[msg_id] = {"peer_id": peer_id_hex, "content": content, "time": time.monotonic(), "retries": 0}
+        self._enforce_ack_cap()
+        self._chat(self.state.nickname, content, is_self=True, conv=peer_id_hex)
 
     async def send_leave(self):
         packet = self._sign(BitchatPacket(
