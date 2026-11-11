@@ -15,6 +15,8 @@ class CLI:
         self.ble_service = BLEService(state, self.redraw_prompt)
         self.session = None
         self._start_time = time.monotonic()
+        # Overridden by the TUI so /dm can open a conversation tab.
+        self.open_dm = lambda peer_id: None
 
     def redraw_prompt(self):
         pass
@@ -71,21 +73,31 @@ class CLI:
             # (+1 counts me) stays in sync with this list.
             self._out(theme.system(f"  ↳ you (you)  {theme.sgr(self.state.nickname or 'unnamed', theme.BOLD)}"))
         elif cmd == "/dm":
-            if len(parts) < 3:
-                self._out(theme.warn("Usage: /dm <peer_id_prefix> <message>"))
+            if len(parts) < 2:
+                self._out(theme.warn("Usage: /dm <peer_id_prefix|nickname> [message]"))
             else:
-                peer_prefix = parts[1]
-                msg = " ".join(parts[2:])
-                # Find peer by prefix
-                target = None
-                for pid in self.state.peer_info:
-                    if pid.startswith(peer_prefix):
-                        target = pid
-                        break
-                if target is None:
-                    self._out(theme.warn(f"No peer matching '{peer_prefix}'"))
+                token = parts[1]
+                # Resolve against verified peers: peer id prefix first, then an
+                # exact (case-insensitive) nickname.
+                matches = [pid for pid in self.state.peer_info if pid.startswith(token)]
+                if not matches:
+                    token_lower = token.lower()
+                    matches = [
+                        pid for pid, info in self.state.peer_info.items()
+                        if str(info.get("nickname", "")).lower() == token_lower
+                    ]
+                if not matches:
+                    self._out(theme.warn(f"No peer matching '{token}'"))
+                elif len(matches) > 1:
+                    self._out(theme.warn(
+                        f"'{token}' matches more than one peer: "
+                        + ", ".join(m[:8] for m in matches)
+                    ))
                 else:
-                    await self.ble_service.send_private_message(target, msg)
+                    target = matches[0]
+                    self.open_dm(target)
+                    if len(parts) >= 3:
+                        await self.ble_service.send_private_message(target, " ".join(parts[2:]))
         elif cmd == "/route":
             if len(parts) < 3:
                 self._out(theme.warn("Usage: /route <peer_id_prefix> <message>"))
@@ -201,7 +213,7 @@ class CLI:
             for name, desc in (
                 ("/w", "List known peers."),
                 ("/peers", "List verified peers with keys."),
-                ("/dm <id> <msg>", "Send encrypted private message."),
+                ("/dm <id|nick> [msg]", "Open a DM tab, optionally sending a message."),
                 ("/route <id> <msg>", "Send message via source-routed path."),
                 ("/verify <id>", "Mark a peer as verified (after comparing fingerprints)."),
                 ("/unverify <id>", "Remove verification from a peer."),

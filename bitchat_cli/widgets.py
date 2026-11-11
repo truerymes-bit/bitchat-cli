@@ -4,21 +4,25 @@ from __future__ import annotations
 
 from rich.text import Text
 from textual.app import ComposeResult
-from textual.containers import Horizontal
-from textual.widgets import Input, RichLog, Static
+from textual.containers import Horizontal, Vertical
+from textual.widgets import Input, RichLog, Static, Tab, Tabs
 
 from . import palette
 
 
-class AppHeader(Horizontal):
+class AppHeader(Vertical):
+    """Brand row, conversation tabs and the link indicator."""
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
     def compose(self) -> ComposeResult:
-        yield Static("B I T C H A T", id="wordmark")
-        with Horizontal():
-            yield Static("●", id="link-dot")
-            yield Static("Offline", id="link-state")
+        with Horizontal(id="header-top"):
+            yield Static("B I T C H A T", id="wordmark")
+            with Horizontal(id="link-container"):
+                yield Static("●", id="link-dot")
+                yield Static("Offline", id="link-state")
+        yield Tabs(id="conv-tabs")
 
     def update_link(self, dot: str, dot_color: str, label: str, label_color: str) -> None:
         try:
@@ -32,24 +36,61 @@ class RoomHeader(Horizontal):
     def __init__(self, room: str = "# General", online: int = 1, **kwargs):
         super().__init__(**kwargs)
         self.room = room
-        self.online = online
+        self._status = f"{online} online"
 
     def compose(self) -> ComposeResult:
-        yield Static(f"{self.room} · {self.online} online", id="room-online")
+        yield Static(self._text(), id="room-online")
+
+    def _text(self) -> str:
+        return f"{self.room} · {self._status}"
 
     def update_online(self, online: int) -> None:
+        self._status = f"{online} online"
+        self._push()
+
+    def update_room(self, room: str, status: str) -> None:
+        self.room = room
+        self._status = status
+        self._push()
+
+    def _push(self) -> None:
         try:
-            self.query_one("#room-online", Static).update(f"{self.room} · {online} online")
+            self.query_one("#room-online", Static).update(self._text())
         except Exception:
             pass
 
 
 class ConversationView(RichLog):
+    """A RichLog that accepts writes while it is hidden (a background tab).
+
+    RichLog renders at its own width; a hidden tab has none, so a line written
+    then would come out blank. Queue those lines and replay them once the tab
+    has been given a size.
+    """
+
     def __init__(self, **kwargs):
         # min_width=0: the default (78) forces content wider than a 76-column pane at
         # 80x24, producing a horizontal scrollbar.
         super().__init__(highlight=False, markup=False, wrap=True, auto_scroll=False,
                          min_width=0, **kwargs)
+        self._queued: list[tuple] = []
+
+    def write(self, content, **kwargs):
+        if self.region.width == 0:
+            self._queued.append((content, kwargs))
+            return self
+        return super().write(content, **kwargs)
+
+    def clear(self):
+        self._queued.clear()
+        return super().clear()
+
+    def on_resize(self, event) -> None:
+        super().on_resize(event)
+        if self._queued and self.region.width:
+            queued, self._queued = self._queued, []
+            for content, kwargs in queued:
+                super().write(content, **kwargs)
 
 
 class InputPanel(Horizontal):

@@ -12,6 +12,9 @@ from enum import Enum
 from typing import Any
 
 
+GENERAL = "general"
+
+
 class EventType(str, Enum):
     OUTPUT = "output"   # a themed line that used to go to stdout
     STATUS = "status"   # request to refresh status widgets
@@ -21,6 +24,7 @@ class EventType(str, Enum):
 class AppEvent:
     type: EventType
     payload: Any = None
+    conv: str | None = None
 
 
 class EventBus:

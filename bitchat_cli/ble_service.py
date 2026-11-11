@@ -49,7 +49,8 @@ from .bluez_central import BluezAdvertisement as AdvertisementData
 from prompt_toolkit import print_formatted_text
 from prompt_toolkit.formatted_text import ANSI
 
-from . import theme
+from . import palette, theme
+from .events import AppEvent, EventBus, EventType, GENERAL
 from .debuglog import dlog
 from .chat_state import ChatState
 from .media import (
@@ -697,7 +698,7 @@ class BLEService:
                 self.state.add_message(
                     BitchatMessage(content=display, sender=sender, timestamp=packet.timestamp)
                 )
-                self._chat(f"[DM] {sender}", display, ts_ms=packet.timestamp)
+                self._chat(sender, display, ts_ms=packet.timestamp, conv=peer_id)
                 # Send delivery ACK back, mirroring Android's sendDeliveryAck.
                 if msg_id is not None:
                     asyncio.ensure_future(self._send_delivery_ack(peer_id, msg_id))
@@ -958,7 +959,7 @@ class BLEService:
         self.state.add_message(
             BitchatMessage(content=content, sender=sender, timestamp=packet.timestamp)
         )
-        self._chat(sender, content, ts_ms=packet.timestamp)
+        self._chat(sender, content, ts_ms=packet.timestamp, conv=GENERAL)
 
     def _handle_leave(self, packet: BitchatPacket):
         peer_id = packet.sender_id.hex()
@@ -994,7 +995,7 @@ class BLEService:
         self.state.add_message(
             BitchatMessage(content=content, sender=sender, timestamp=packet.timestamp)
         )
-        self._media(sender, category, filename, path=path, ts_ms=packet.timestamp)
+        self._media(sender, category, filename, path=path, ts_ms=packet.timestamp, conv=GENERAL)
         self._open_file(path)
 
     @staticmethod
@@ -1063,7 +1064,7 @@ class BLEService:
             self._sync_manager.record_packet(packet)
         message = BitchatMessage(content=content, sender=self.state.nickname)
         self.state.add_message(message)
-        self._chat(self.state.nickname, content, is_self=True)
+        self._chat(self.state.nickname, content, is_self=True, conv=GENERAL)
         return message
 
     async def send_routed_message(self, recipient_hex: str, content: str):
@@ -1135,7 +1136,7 @@ class BLEService:
             self._sys("Direct peer - broadcasting.")
         message = BitchatMessage(content=content, sender=self.state.nickname)
         self.state.add_message(message)
-        self._chat(self.state.nickname, content, is_self=True)
+        self._chat(self.state.nickname, content, is_self=True, conv=GENERAL)
         return message
 
     async def _send_delivery_ack(self, recipient_peer_id: str, message_id: str):
@@ -1209,7 +1210,7 @@ class BLEService:
             dlog(f"DM_SEND: sender={self.state.my_peer_id.hex()} recipient={peer_id_hex} ttl={DEFAULT_TTL}")
             await self._broadcast(packet)
             self._pending_acks[msg_id] = {"peer_id": peer_id_hex, "content": content, "time": time.monotonic(), "retries": 0}
-            self._chat(f"[DM to {peer_id_hex[:8]}]", content, is_self=True)
+            self._chat(self.state.nickname, content, is_self=True, conv=peer_id_hex)
         except Exception as e:
             self._warn(f"Failed to send private message: {e}")
 
@@ -1396,41 +1397,43 @@ class BLEService:
     # Output helpers — all chat/system output flows through here so the
     # styling (see theme.py) stays consistent and the prompt is redrawn.
     # ------------------------------------------------------------------ #
-    def _emit(self, line: str):
-        # Under prompt_toolkit's patch_stdout(), a plain print() of raw ANSI
-        # escapes is rendered literally; print_formatted_text(ANSI(...)) parses
-        # the codes and renders them correctly above the live prompt.
+    def _emit(self, line: str, conv: str | None = None):
+        # The plain stdout path (main.py --headless) has no conversation tabs, so
+        # private lines keep their [DM] label there. The TUI overrides _emit and
+        # ignores `conv` for labelling: a DM tab already identifies the peer.
+        if conv is not None and conv != GENERAL:
+            line = f"[DM] {line}"
         print_formatted_text(ANSI(line))
         self.cli_redraw()
 
-    def _sys(self, msg: str):
+    def _sys(self, msg: str, conv: str | None = None):
         dlog(f"SYS {msg}")
-        self._emit(theme.system(msg))
+        self._emit(theme.system(msg), conv=conv)
 
-    def _ok(self, msg: str):
+    def _ok(self, msg: str, conv: str | None = None):
         dlog(f"OK {msg}")
-        self._emit(theme.ok(msg))
+        self._emit(theme.ok(msg), conv=conv)
 
-    def _warn(self, msg: str):
+    def _warn(self, msg: str, conv: str | None = None):
         dlog(f"WARN {msg}")
-        self._emit(theme.warn(msg))
+        self._emit(theme.warn(msg), conv=conv)
 
-    def _err(self, msg: str):
+    def _err(self, msg: str, conv: str | None = None):
         dlog(f"ERR {msg}")
-        self._emit(theme.error(msg))
+        self._emit(theme.error(msg), conv=conv)
 
-    def _join(self, msg: str):
+    def _join(self, msg: str, conv: str | None = None):
         dlog(f"JOIN {msg}")
-        self._emit(theme.join(msg))
+        self._emit(theme.join(msg), conv=conv)
 
-    def _leave(self, msg: str):
+    def _leave(self, msg: str, conv: str | None = None):
         dlog(f"LEAVE {msg}")
-        self._emit(theme.leave(msg))
+        self._emit(theme.leave(msg), conv=conv)
 
-    def _chat(self, sender: str, content: str, ts_ms=None, is_self: bool = False):
-        self._emit(theme.chat(sender, content, ts_ms=ts_ms, is_self=is_self))
+    def _chat(self, sender: str, content: str, ts_ms=None, is_self: bool = False, conv: str | None = None):
+        self._emit(theme.chat(sender, content, ts_ms=ts_ms, is_self=is_self), conv=conv)
 
     def _media(self, sender: str, category: str, label: str, path=None,
-               ts_ms=None, is_self: bool = False):
+               ts_ms=None, is_self: bool = False, conv: str | None = None):
         self._emit(theme.media(sender, category, label, path=path,
-                               ts_ms=ts_ms, is_self=is_self))
+                               ts_ms=ts_ms, is_self=is_self), conv=conv)

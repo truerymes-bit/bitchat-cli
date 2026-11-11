@@ -12,12 +12,13 @@ from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.containers import Vertical
 from textual.binding import Binding
-from textual.widgets import Input, Static
+from textual.widgets import Input, Static, Tabs, Tab, ContentSwitcher
 
+from . import palette, theme
 from .ble_service import BLEService
 from .chat_state import ChatState
 from .cli import CLI
-from .events import AppEvent, EventBus, EventType
+from .events import AppEvent, EventBus, EventType, GENERAL
 from .screens import SettingsScreen
 from .widgets import (
     AppFooter,
@@ -26,7 +27,6 @@ from .widgets import (
     InputPanel,
     RoomHeader,
 )
-from . import palette, theme
 
 
 class BitchatApp(App):
@@ -35,11 +35,17 @@ class BitchatApp(App):
     # Key map. No single-letter bindings. ctrl+q is Textual's own quit; ctrl+c is
     # left to copy (Screen/Input). F1-F4 are unbound in Textual, Input, RichLog
     # and ghostty's default keybinds.
+    # ctrl+w is a priority binding: the Input widget binds it to delete_left_word,
+    # and priority bindings are checked from the app down, so the tab still closes
+    # while the input has focus.
     BINDINGS = [
         Binding("f1", "show_help", "Help"),
         Binding("f2", "show_peers", "Peers"),
         Binding("f3", "clear_chat", "Clear"),
         Binding("f4", "show_settings", "Settings"),
+        Binding("alt+left", "prev_tab", "Previous tab", show=False),
+        Binding("alt+right", "next_tab", "Next tab", show=False),
+        Binding("ctrl+w", "close_tab", "Close tab", show=False, priority=True),
         Binding("ctrl+q", "quit", "Quit"),
     ]
 
@@ -55,20 +61,194 @@ class BitchatApp(App):
         self.ble_service = BLEService(state, self._request_redraw)
         self.cli = CLI(state)
         self.cli.ble_service = self.ble_service
-        self.cli._out = lambda line: self.event_bus.publish_nowait(
-            AppEvent(EventType.OUTPUT, line)
+        self.cli._out = lambda line, conv=None: self.event_bus.publish_nowait(
+            AppEvent(EventType.OUTPUT, line, conv)
         )
         self.cli.redraw_prompt = self._request_redraw
         self.cli.clear_screen = self.action_clear_chat
-        self.ble_service._emit = lambda line: self.event_bus.publish_nowait(
-            AppEvent(EventType.OUTPUT, line)
+        self.cli.open_dm = self.open_dm
+        self.ble_service._emit = lambda line, conv=None: self.event_bus.publish_nowait(
+            AppEvent(EventType.OUTPUT, line, conv)
         )
+
+        # Conversation key -> (ConversationView, unread count). Closed DM tabs
+        # keep their view here so history survives the session.
+        self.conversations: dict[str, tuple[ConversationView, int]] = {}
+        self._current_conv = GENERAL
+
+    # ------------------------------------------------------------------ #
+    # Conversation / tab management
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _tab_id(key: str) -> str:
+        return f"tab-{key}"
+
+    @staticmethod
+    def _view_id(key: str) -> str:
+        return f"conv-{key}"
+
+    def _label_for(self, key: str) -> str:
+        if key == GENERAL:
+            return "# General"
+        nick = self.state.peer_nicknames.get(key)
+        return f"@{nick}" if nick else f"@{key[:8]}"
+
+    def _ensure_view(self, key: str, set_current: bool = False) -> None:
+        if key in self.conversations:
+            return
+        view = ConversationView(id=self._view_id(key))
+        switcher = self.query_one("#conversation-switcher", ContentSwitcher)
+        view.display = False
+        self.conversations[key] = (view, 0)
+        switcher.mount(view)
+        if set_current:
+            switcher.current = view.id
+
+    def _ensure_tab(self, key: str) -> None:
+        tab_id = self._tab_id(key)
+        tabs = self.query_one("#conv-tabs", Tabs)
+        if tabs.get_tab(tab_id) is not None:
+            return
+        tabs.add_tab(Tab(self._label_for(key), id=tab_id))
+
+    def _ensure_conv(self, key: str) -> None:
+        self._ensure_view(key)
+        self._ensure_tab(key)
+
+    def _set_tab_label(self, key: str, unread: int | None = None) -> None:
+        entry = self.conversations.get(key)
+        if entry is None:
+            return
+        if unread is None:
+            unread = entry[1]
+        label = self._label_for(key)
+        if unread:
+            label = f"{label} ({unread})"
+        try:
+            self.query_one(f"#{self._tab_id(key)}", Tab).label = label
+        except Exception:
+            pass
+
+    def _refresh_tabs(self) -> None:
+        for key in list(self.conversations):
+            self._set_tab_label(key)
+
+    def _open_keys(self) -> list[str]:
+        """Keys of the currently open tabs, in display order."""
+        try:
+            tabs = self.query_one("#conv-tabs", Tabs)
+        except Exception:
+            return []
+        keys = []
+        for tab in tabs.query(Tab):
+            tab_id = tab.id or ""
+            if tab_id.startswith("tab-"):
+                keys.append(tab_id[len("tab-"):])
+        return keys
+
+    def _switch_conv(self, key: str) -> None:
+        if key not in self.conversations:
+            self._ensure_conv(key)
+        self._current_conv = key
+        try:
+            tabs = self.query_one("#conv-tabs", Tabs)
+            if tabs.get_tab(self._tab_id(key)) is not None:
+                tabs.active = self._tab_id(key)
+        except Exception:
+            pass
+        try:
+            switcher = self.query_one("#conversation-switcher", ContentSwitcher)
+            if switcher.get_child_by_id(self._view_id(key)) is not None:
+                switcher.current = self._view_id(key)
+        except Exception:
+            pass
+        self._clear_unread(key)
+        self._update_room_header()
+        try:
+            self.query_one("#input", Input).focus()
+        except Exception:
+            pass
+
+    def _clear_unread(self, key: str) -> None:
+        entry = self.conversations.get(key)
+        if entry is None or not entry[1]:
+            return
+        self.conversations[key] = (entry[0], 0)
+        self._set_tab_label(key, 0)
+
+    def _bump_unread(self, key: str) -> None:
+        entry = self.conversations.get(key)
+        if entry is None:
+            return
+        unread = entry[1] + 1
+        self.conversations[key] = (entry[0], unread)
+        self._set_tab_label(key, unread)
+
+    def open_dm(self, peer_id_hex: str, switch: bool = True) -> None:
+        """Create or restore a DM tab; `switch=True` also activates it."""
+        key = (peer_id_hex or "").lower()
+        if not key:
+            return
+        self._ensure_view(key)
+        self._ensure_tab(key)
+        if switch:
+            self._switch_conv(key)
+
+    def _move_tab(self, delta: int) -> None:
+        keys = self._open_keys()
+        if not keys:
+            return
+        try:
+            index = keys.index(self._current_conv)
+        except ValueError:
+            index = 0
+        self._switch_conv(keys[(index + delta) % len(keys)])
+
+    def action_prev_tab(self) -> None:
+        self._move_tab(-1)
+
+    def action_next_tab(self) -> None:
+        self._move_tab(+1)
+
+    def action_close_tab(self) -> None:
+        key = self._current_conv
+        if key == GENERAL:
+            return
+        # Switch away first so the removed tab is not the active one (Tabs would
+        # otherwise auto-activate a neighbour and post its own TabActivated).
+        self._switch_conv(GENERAL)
+        try:
+            self.query_one("#conv-tabs", Tabs).remove_tab(self._tab_id(key))
+        except Exception:
+            pass
+
+    def on_tabs_tab_activated(self, event: Tabs.TabActivated) -> None:
+        tab_id = event.tab.id or ""
+        if not tab_id.startswith("tab-"):
+            return
+        key = tab_id[len("tab-"):]
+        if key == self._current_conv:
+            return
+        self._switch_conv(key)
+
+    def _update_room_header(self) -> None:
+        try:
+            room = self.query_one("#room-header", RoomHeader)
+        except Exception:
+            return
+        key = self._current_conv
+        if key == GENERAL:
+            room.update_room("# General", f"{len(self.state.peer_nicknames) + 1} online")
+            return
+        nick = self.state.peer_nicknames.get(key)
+        status = "online" if key in self.state.peer_nicknames else "offline"
+        room.update_room(f"@{nick}" if nick else f"@{key[:8]}", status)
 
     def compose(self) -> ComposeResult:
         yield AppHeader(id="app-header")
         with Vertical(id="conversation"):
             yield RoomHeader(id="room-header")
-            yield ConversationView(id="chat")
+            yield ContentSwitcher(id="conversation-switcher")
         yield InputPanel(id="input-panel")
         yield AppFooter(id="footer")
 
@@ -78,6 +258,9 @@ class BitchatApp(App):
         self._consumer_task = asyncio.ensure_future(self._consume_events())
         self._status_task = asyncio.ensure_future(self._status_loop())
         self._apply_responsive(self.size.width)
+        self._ensure_view(GENERAL, set_current=True)
+        self._ensure_tab(GENERAL)
+        self._switch_conv(GENERAL)
         self._refresh_status()
 
     async def action_show_help(self) -> None:
@@ -88,10 +271,9 @@ class BitchatApp(App):
 
     def action_clear_chat(self) -> None:
         # Display only: ChatState.messages and all network state are untouched.
-        try:
-            self.query_one("#chat", ConversationView).clear()
-        except Exception:
-            pass
+        entry = self.conversations.get(self._current_conv)
+        if entry is not None:
+            entry[0].clear()
 
     def action_show_settings(self) -> None:
         self.push_screen(
@@ -136,7 +318,7 @@ class BitchatApp(App):
         while True:
             ev = await self.event_bus.get()
             if ev.type == EventType.OUTPUT:
-                self._append_line(ev.payload)
+                self._append_line(ev.payload, ev.conv)
             elif ev.type == EventType.STATUS:
                 self._refresh_status()
 
@@ -148,7 +330,6 @@ class BitchatApp(App):
     def _refresh_status(self) -> None:
         try:
             header = self.query_one(AppHeader)
-            room = self.query_one("#room-header", RoomHeader)
         except Exception:
             return
         st = self.state
@@ -166,18 +347,24 @@ class BitchatApp(App):
             col = palette.RED
             label = "Offline"
         header.update_link("●", col, label, col)
-        # Room-header online count (counts me).
-        room.update_online(len(st.peer_nicknames) + 1)
+        self._update_room_header()
+        self._refresh_tabs()
 
-    def _append_line(self, line: str) -> None:
-        try:
-            log = self.query_one("#chat", ConversationView)
-        except Exception:
+    def _append_line(self, line: str, conv: str | None = None) -> None:
+        key = conv if conv is not None else self._current_conv
+        if key != GENERAL and key not in self.conversations:
+            # A DM from a peer with no tab yet: create it, do not steal focus.
+            self._ensure_conv(key)
+        entry = self.conversations.get(key)
+        if entry is None:
             return
-        at_bottom = log.scroll_offset.y >= log.max_scroll_y
-        log.write(Text.from_ansi(str(line)), expand=True)
+        view = entry[0]
+        at_bottom = view.scroll_offset.y >= view.max_scroll_y
+        view.write(Text.from_ansi(str(line)), expand=True)
         if at_bottom:
-            log.scroll_end(animate=False)
+            view.scroll_end(animate=False)
+        if key != self._current_conv:
+            self._bump_unread(key)
 
     async def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id != "input":
@@ -187,6 +374,23 @@ class BitchatApp(App):
         if not text:
             return
         if text.startswith("/"):
+            if self._current_conv != GENERAL:
+                cmd = text.split(" ", 1)[0].lower()
+                if cmd in ("/send", "/file"):
+                    self._append_line(theme.warn(
+                        "File DMs are not supported yet. "
+                        "Switch to General to broadcast a file."
+                    ))
+                    return
             await self.cli.handle_command(text)
-        else:
-            await self.ble_service.send_public_message(text)
+            return
+        key = self._current_conv
+        if key == GENERAL:
+            self.run_worker(self.ble_service.send_public_message(text))
+            return
+        if key not in self.state.peer_info:
+            self._append_line(theme.warn(
+                f"Cannot DM {key[:8]}: no Noise key known for that peer yet."
+            ))
+            return
+        self.run_worker(self.ble_service.send_private_message(key, text))
