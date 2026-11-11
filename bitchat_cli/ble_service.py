@@ -220,6 +220,7 @@ class BLEService:
         self._outbox: Dict[str, dict] = {}   # msg_id -> {peer_id, content, enqueued_at, sent_at, state}
         self._hs_retry: Dict[str, tuple] = {}  # peer_id -> (attempts, next_at)
         self._needs_announce: Set[str] = set()
+        self.dm_status_cb = lambda conv, msg_id, state: None  # UI hook: outgoing DM state changed
         self._unread_incoming: Dict[str, List[str]] = {}  # peer -> incoming DM msg_ids not yet read-receipted
         self._sent_read_receipts: Set[str] = set()        # msg_ids we already sent a READ_RECEIPT for
         self.dm_visible = lambda peer_id: False           # UI hook: is this DM tab shown and the app focused?
@@ -687,7 +688,7 @@ class BLEService:
                 self.state.add_message(
                     BitchatMessage(content=display, sender=sender, timestamp=packet.timestamp)
                 )
-                self._chat(sender, display, ts_ms=packet.timestamp, conv=peer_id)
+                self._chat(sender, display, ts_ms=packet.timestamp, conv=peer_id, msg_id=msg_id)
                 # Send delivery ACK back, mirroring Android's sendDeliveryAck.
                 if msg_id is not None:
                     asyncio.ensure_future(self._send_delivery_ack(peer_id, msg_id))
@@ -1231,6 +1232,7 @@ class BLEService:
         if ok:
             e["state"] = new
             dlog(f"DM_STATE: msg_id={msg_id[:8]} {old}->{new}")
+            self.dm_status_cb(e["peer_id"], msg_id, new)
         return ok
 
     async def _transmit_dm(self, peer_id_hex: str, content: str, msg_id: str) -> bool:
@@ -1337,7 +1339,7 @@ class BLEService:
         now = self.clock()
         self._outbox[msg_id] = {"peer_id": peer_id_hex, "content": content,
                                 "enqueued_at": now, "sent_at": None, "state": "sending"}
-        self._chat(self.state.nickname, content, is_self=True, conv=peer_id_hex)
+        self._chat(self.state.nickname, content, is_self=True, conv=peer_id_hex, msg_id=msg_id)
         if self._dm_session_ready(peer_id_hex):
             await self._flush_peer(peer_id_hex, now)
         return msg_id
@@ -1525,7 +1527,8 @@ class BLEService:
     # Output helpers — all chat/system output flows through here so the
     # styling (see theme.py) stays consistent and the prompt is redrawn.
     # ------------------------------------------------------------------ #
-    def _emit(self, line: str, conv: str | None = None):
+    def _emit(self, line: str, conv: str | None = None, msg_id: str | None = None,
+              is_self: bool = False):
         # The plain stdout path (main.py --headless) has no conversation tabs, so
         # private lines keep their [DM] label there. The TUI overrides _emit and
         # ignores `conv` for labelling: a DM tab already identifies the peer.
@@ -1558,8 +1561,10 @@ class BLEService:
         dlog(f"LEAVE {msg}")
         self._emit(theme.leave(msg), conv=conv)
 
-    def _chat(self, sender: str, content: str, ts_ms=None, is_self: bool = False, conv: str | None = None):
-        self._emit(theme.chat(sender, content, ts_ms=ts_ms, is_self=is_self), conv=conv)
+    def _chat(self, sender: str, content: str, ts_ms=None, is_self: bool = False,
+              conv: str | None = None, msg_id: str | None = None):
+        self._emit(theme.chat(sender, content, ts_ms=ts_ms, is_self=is_self), conv=conv,
+                   msg_id=msg_id, is_self=is_self)
 
     def _media(self, sender: str, category: str, label: str, path=None,
                ts_ms=None, is_self: bool = False, conv: str | None = None):

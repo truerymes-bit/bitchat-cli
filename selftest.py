@@ -329,7 +329,7 @@ class RecordingBLEService(_ble.BLEService):
     async def _broadcast(self, packet):
         self.sent.append((self.clock(), packet))
 
-    def _emit(self, line, conv=None):
+    def _emit(self, line, conv=None, msg_id=None, is_self=False):
         self.lines.append((conv, line))
 
     def _has_link(self):

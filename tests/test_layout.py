@@ -11,7 +11,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from textual.widgets import Input, Tab, Tabs
 
+from rich.color import Color
+
 from bitchat_cli.app import BitchatApp
+from bitchat_cli.events import AppEvent, EventType
+from bitchat_cli import palette
+from bitchat_cli.widgets import ConversationView
 from bitchat_cli.chat_state import ChatState
 from bitchat_cli.screens import SettingsScreen
 
@@ -58,6 +63,56 @@ async def _submit(pilot, app: BitchatApp, text: str) -> None:
     await pilot.pause()
     await app.workers.wait_for_complete()
     await asyncio.sleep(0.05)
+
+
+def _line_texts(view) -> list[str]:
+    return [strip.text for strip in view.lines]
+
+
+async def _glyph_scenario(size: tuple[int, int]) -> None:
+    """(g) Status events re-render the DM line with the right glyph (real event bus path)."""
+    app, state = _make_app()
+    _add_peer(state, FAKE_PEER, "bob")
+    mid = "MSG-GLYPH-1"
+    async with app.run_test(size=size) as pilot:
+        await pilot.pause()
+        await asyncio.sleep(0.1)
+        app.open_dm(FAKE_PEER)
+        await pilot.pause()
+        await asyncio.sleep(0.1)
+        view = app.query_one(f"#conv-{FAKE_PEER}", ConversationView)
+
+        def row() -> int:
+            return next(i for i, t in enumerate(_line_texts(view)) if "hello bob" in t)
+
+        app.event_bus.publish_nowait(
+            AppEvent(EventType.OUTPUT, "hello bob", FAKE_PEER, msg_id=mid, is_self=True))
+        await pilot.pause()
+        await asyncio.sleep(0.1)
+        assert _line_texts(view)[row()].rstrip().split()[-1] == "...", _line_texts(view)[row()]
+
+        for status, glyph in (("sent", "\u2713"), ("delivered", "\u2713\u2713"),
+                              ("read", "\u2713\u2713"), ("unconfirmed", "!")):
+            app.event_bus.publish_nowait(AppEvent(EventType.DM_STATUS, {
+                "conv": FAKE_PEER, "msg_id": mid, "state": status}))
+            await pilot.pause()
+            await asyncio.sleep(0.1)
+            text = _line_texts(view)[row()].rstrip()
+            assert text.split()[-1] == glyph, (status, text)
+            print(f"  {size} {status}: {text!r}")
+
+        # Read glyph is drawn in the accent colour.
+        app.event_bus.publish_nowait(AppEvent(EventType.DM_STATUS, {
+            "conv": FAKE_PEER, "msg_id": mid, "state": "read"}))
+        await pilot.pause()
+        await asyncio.sleep(0.1)
+        segs = [s for s in view.lines[row()] if "\u2713" in s.text]
+        assert segs, "no tick segment on the read line"
+        colour = segs[-1].style.color.get_truecolor()
+        assert colour == Color.parse(palette.EMERALD).get_truecolor(), colour
+
+        # One echo line only: re-rendering must not duplicate it.
+        assert sum("hello bob" in t for t in _line_texts(view)) == 1
 
 
 async def _scenario(size: tuple[int, int], label: str) -> None:
@@ -208,6 +263,7 @@ async def _scenario(size: tuple[int, int], label: str) -> None:
 async def test_tabs_and_routing() -> None:
     await _scenario((80, 24), "80x24")
     await _scenario((120, 40), "120x40")
+    await _glyph_scenario((80, 24))
     print("All tests passed!")
 
 

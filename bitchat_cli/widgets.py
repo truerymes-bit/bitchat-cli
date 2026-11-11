@@ -60,13 +60,28 @@ class RoomHeader(Horizontal):
             pass
 
 
-class ConversationView(RichLog):
-    """A RichLog that accepts writes while it is hidden (a background tab).
+def _status_glyph(state):
+    """Tick glyph and colour for an outgoing DM state (None = no glyph)."""
+    return {
+        "sending": ("...", palette.MUTED),
+        "sent": ("\u2713", palette.MUTED),
+        "delivered": ("\u2713\u2713", palette.MUTED),
+        "read": ("\u2713\u2713", palette.EMERALD),
+        "failed": ("!", palette.RED),
+        "unconfirmed": ("!", palette.RED),
+    }.get(state)
 
-    RichLog renders at its own width; a hidden tab has none, so a line written
-    then would come out blank. Queue those lines and replay them once the tab
-    has been given a size.
+
+class ConversationView(RichLog):
+    """A RichLog that keeps its entries so outgoing DM lines can re-render their status.
+
+    Entries are (line, msg_id, is_self, state). A status change clears the log and
+    rewrites every entry, so the glyph on a line updates in place. Capped at
+    MAX_ENTRIES; the oldest are dropped. Writes while the tab has no width (a
+    hidden background tab) are queued and replayed once the tab is sized.
     """
+
+    MAX_ENTRIES = 1000
 
     def __init__(self, **kwargs):
         # min_width=0: the default (78) forces content wider than a 76-column pane at
@@ -74,6 +89,7 @@ class ConversationView(RichLog):
         super().__init__(highlight=False, markup=False, wrap=True, auto_scroll=False,
                          min_width=0, **kwargs)
         self._queued: list[tuple] = []
+        self._entries: list[dict] = []
 
     def write(self, content, **kwargs):
         if self.region.width == 0:
@@ -82,15 +98,54 @@ class ConversationView(RichLog):
         return super().write(content, **kwargs)
 
     def clear(self):
+        self._entries.clear()
         self._queued.clear()
         return super().clear()
 
     def on_resize(self, event) -> None:
+        # Replay lines written while this tab had no width (see write()).
         super().on_resize(event)
         if self._queued and self.region.width:
             queued, self._queued = self._queued, []
             for content, kwargs in queued:
                 super().write(content, **kwargs)
+
+    def add_entry(self, line: str, msg_id: str | None = None, is_self: bool = False,
+                  state: str | None = None) -> None:
+        self._entries.append({"line": line, "msg_id": msg_id, "is_self": is_self, "state": state})
+        if len(self._entries) > self.MAX_ENTRIES:
+            del self._entries[: len(self._entries) - self.MAX_ENTRIES]
+            self._rerender()
+            return
+        self.write(self._render(self._entries[-1]), expand=True)
+
+    def set_state(self, msg_id: str, state: str) -> bool:
+        """Update the status of an outgoing line and re-render. True if a line matched."""
+        hit = False
+        for e in self._entries:
+            if e["is_self"] and e["msg_id"] == msg_id:
+                e["state"] = state
+                hit = True
+        if hit:
+            at_bottom = self.scroll_offset.y >= self.max_scroll_y
+            self._rerender()
+            if at_bottom:
+                self.scroll_end(animate=False)
+        return hit
+
+    def _render(self, entry: dict) -> Text:
+        text = Text.from_ansi(str(entry["line"]))
+        glyph = _status_glyph(entry["state"]) if entry["is_self"] else None
+        if glyph is not None:
+            text.append("  ")
+            text.append(glyph[0], style=glyph[1])
+        return text
+
+    def _rerender(self) -> None:
+        self._queued.clear()
+        RichLog.clear(self)
+        for e in self._entries:
+            self.write(self._render(e), expand=True)
 
 
 class InputPanel(Horizontal):

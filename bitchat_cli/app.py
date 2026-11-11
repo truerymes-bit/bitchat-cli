@@ -62,14 +62,15 @@ class BitchatApp(App):
         self.cli = CLI(state)
         self.cli.ble_service = self.ble_service
         self.ble_service.dm_visible = self._dm_visible
+        self.ble_service.dm_status_cb = self._publish_dm_status
         self.cli._out = lambda line, conv=None: self.event_bus.publish_nowait(
             AppEvent(EventType.OUTPUT, line, conv)
         )
         self.cli.redraw_prompt = self._request_redraw
         self.cli.clear_screen = self.action_clear_chat
         self.cli.open_dm = self.open_dm
-        self.ble_service._emit = lambda line, conv=None: self.event_bus.publish_nowait(
-            AppEvent(EventType.OUTPUT, line, conv)
+        self.ble_service._emit = lambda line, conv=None, msg_id=None, is_self=False: self.event_bus.publish_nowait(
+            AppEvent(EventType.OUTPUT, line, conv, msg_id=msg_id, is_self=is_self)
         )
 
         # Conversation key -> (ConversationView, unread count). Closed DM tabs
@@ -326,7 +327,9 @@ class BitchatApp(App):
         while True:
             ev = await self.event_bus.get()
             if ev.type == EventType.OUTPUT:
-                self._append_line(ev.payload, ev.conv)
+                self._append_line(ev.payload, ev.conv, ev.msg_id, ev.is_self)
+            elif ev.type == EventType.DM_STATUS:
+                self._on_dm_status(ev.payload)
             elif ev.type == EventType.STATUS:
                 self._refresh_status()
 
@@ -358,7 +361,8 @@ class BitchatApp(App):
         self._update_room_header()
         self._refresh_tabs()
 
-    def _append_line(self, line: str, conv: str | None = None) -> None:
+    def _append_line(self, line: str, conv: str | None = None, msg_id: str | None = None,
+                     is_self: bool = False) -> None:
         key = conv if conv is not None else self._current_conv
         if key != GENERAL and key not in self.conversations:
             # A DM from a peer with no tab yet: create it, do not steal focus.
@@ -368,11 +372,22 @@ class BitchatApp(App):
             return
         view = entry[0]
         at_bottom = view.scroll_offset.y >= view.max_scroll_y
-        view.write(Text.from_ansi(str(line)), expand=True)
+        # Outgoing DM lines carry a status glyph: they start as "sending".
+        view.add_entry(str(line), msg_id=msg_id, is_self=is_self,
+                       state="sending" if (is_self and msg_id) else None)
         if at_bottom:
             view.scroll_end(animate=False)
         if key != self._current_conv:
             self._bump_unread(key)
+
+    def _publish_dm_status(self, conv: str, msg_id: str, state: str) -> None:
+        self.event_bus.publish_nowait(AppEvent(EventType.DM_STATUS, {
+            "conv": conv, "msg_id": msg_id, "state": state}))
+
+    def _on_dm_status(self, payload: dict) -> None:
+        entry = self.conversations.get(payload["conv"])
+        if entry is not None:
+            entry[0].set_state(payload["msg_id"], payload["state"])
 
     async def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id != "input":
